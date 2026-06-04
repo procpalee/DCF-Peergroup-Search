@@ -37,16 +37,36 @@ async function makeAuthenticatedRequest(
     );
   }
 
-  const response = await axios.post<ApiResponse>(url, data, {
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      ...(sessionId ? { Cookie: `JSESSIONID=${sessionId}` } : {}),
-      "X-Requested-With": "XMLHttpRequest",
-      ...BROWSER_HEADERS,
-    },
-    timeout: 30000,
-    validateStatus: () => true,
-  });
+  let response;
+  try {
+    response = await axios.post<ApiResponse>(url, data, {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        // XHR JSON 요청에 맞는 Accept (html Accept를 보내면 일부 서버가 연결을 리셋함)
+        Accept: "application/json, text/javascript, */*; q=0.01",
+        "User-Agent": BROWSER_HEADERS["User-Agent"],
+        "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+        "X-Requested-With": "XMLHttpRequest",
+        ...(sessionId ? { Cookie: `JSESSIONID=${sessionId}` } : {}),
+      },
+      timeout: 30000,
+      validateStatus: () => true,
+    });
+  } catch (networkError) {
+    // socket hang up(ECONNRESET) 등 응답 없이 끊긴 경우: 세션 갱신 후 1회 재시도
+    if (retried) throw networkError;
+    console.log(
+      `[KICPA API] POST network error, retrying with fresh session: ${
+        networkError instanceof Error ? networkError.message : networkError
+      }`
+    );
+    try {
+      await refreshSession();
+    } catch {
+      /* 세션 갱신 실패는 무시하고 재시도에서 POST로 세션 확보 시도 */
+    }
+    return makeAuthenticatedRequest(url, data, true);
+  }
 
   // POST 응답에 새 세션 쿠키가 실려오면 캐시를 갱신한다.
   const capturedNewSession = captureSessionFromResponse(response);
