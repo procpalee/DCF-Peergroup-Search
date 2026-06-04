@@ -11,32 +11,66 @@ import {
   URL_VIEW,
 } from "./constants";
 import type { ApiResponse, StockBetaResult } from "./types";
-import { getSessionCookie, refreshSession } from "./auth";
+import {
+  getSessionCookie,
+  refreshSession,
+  captureSessionFromResponse,
+  BROWSER_HEADERS,
+} from "./auth";
 
 async function makeAuthenticatedRequest(
   url: string,
   data: string,
   retried = false
 ): Promise<ApiResponse> {
-  const sessionId = await getSessionCookie();
+  // 세션 페이지 GET이 쿠키를 안 줄 수도 있으므로(서버가 POST 응답에서만 세션을 내려주는 경우)
+  // 세션 획득 실패는 치명적으로 보지 않고 쿠키 없이 POST를 시도한 뒤 응답에서 세션을 캡처한다.
+  let sessionId: string | null = null;
+  try {
+    sessionId = await getSessionCookie();
+  } catch (sessionError) {
+    if (retried) throw sessionError;
+    console.log(
+      `[KICPA API] Session page GET yielded no cookie, attempting POST to obtain session: ${
+        sessionError instanceof Error ? sessionError.message : sessionError
+      }`
+    );
+  }
 
   const response = await axios.post<ApiResponse>(url, data, {
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      "Cookie": `JSESSIONID=${sessionId}`,
+      ...(sessionId ? { Cookie: `JSESSIONID=${sessionId}` } : {}),
       "X-Requested-With": "XMLHttpRequest",
+      ...BROWSER_HEADERS,
     },
     timeout: 30000,
+    validateStatus: () => true,
   });
 
-  if (response.data.resultCode === "error" && !retried) {
-    console.log("[KICPA API] First attempt failed. Refreshing session...");
-    try {
-      await refreshSession();
-      return makeAuthenticatedRequest(url, data, true);
-    } catch (refreshError) {
-      console.log(`[KICPA API] Session refresh failed: ${refreshError instanceof Error ? refreshError.message : refreshError}`);
+  // POST 응답에 새 세션 쿠키가 실려오면 캐시를 갱신한다.
+  const capturedNewSession = captureSessionFromResponse(response);
+
+  const httpOk = response.status >= 200 && response.status < 300;
+  const failed = !httpOk || response.data?.resultCode === "error";
+
+  if (failed && !retried) {
+    console.log(
+      `[KICPA API] First attempt failed (status ${response.status}, resultCode ${response.data?.resultCode}). Retrying with fresh session...`
+    );
+    // POST에서 방금 새 세션을 받았다면 그걸로 즉시 재시도, 아니면 세션 페이지를 다시 긁는다.
+    if (!capturedNewSession) {
+      try {
+        await refreshSession();
+      } catch (refreshError) {
+        console.log(
+          `[KICPA API] Session refresh failed: ${
+            refreshError instanceof Error ? refreshError.message : refreshError
+          }`
+        );
+      }
     }
+    return makeAuthenticatedRequest(url, data, true);
   }
 
   return response.data;
