@@ -72,6 +72,17 @@ async function makeAuthenticatedRequest(
   const capturedNewSession = captureSessionFromResponse(response);
 
   const httpOk = response.status >= 200 && response.status < 300;
+  // KOSCOM이 점검/장애 상태이면 HTML "장애안내" 페이지를 200/500으로 내려준다.
+  // (JSON 대신 문자열 본문) → 세션/파라미터 문제로 오인하지 않도록 별도 감지.
+  if (isKoscomOutage(response.status, response.data)) {
+    if (!retried) {
+      return makeAuthenticatedRequest(url, data, true);
+    }
+    throw new Error(
+      "KICPA_UPSTREAM_UNAVAILABLE: 한국공인회계사회(KICPA) CHECKExpert+/KOSCOM 데이터 서버가 현재 점검 또는 장애 상태입니다 ('장애안내' 응답). 잠시 후 다시 시도해주세요."
+    );
+  }
+
   const failed = !httpOk || response.data?.resultCode === "error";
 
   if (failed && !retried) {
@@ -94,6 +105,21 @@ async function makeAuthenticatedRequest(
   }
 
   return response.data;
+}
+
+/**
+ * KOSCOM 데이터몰 점검/장애 응답인지 판별한다.
+ * 정상 응답은 JSON(resultCode 포함)이지만, 장애 시 HTML "장애안내" 페이지가 내려온다.
+ */
+function isKoscomOutage(status: number, body: unknown): boolean {
+  if (typeof body === "string") {
+    return (
+      body.includes("장애안내") ||
+      body.includes("장애 안내") ||
+      (status >= 500 && body.includes("<html"))
+    );
+  }
+  return false;
 }
 
 export interface FetchBetaParams {

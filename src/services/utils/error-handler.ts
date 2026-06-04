@@ -16,6 +16,8 @@ export function handleApiError(error: unknown): string {
       return "Error: 요청 시간 초과. KOSCOM 서버 응답이 없습니다. 잠시 후 다시 시도해주세요.";
     } else if (axiosErr.code === "ECONNREFUSED") {
       return "Error: KOSCOM 서버에 연결할 수 없습니다. 네트워크 연결을 확인해주세요.";
+    } else if (axiosErr.code === "ECONNRESET" || /socket hang up/i.test(axiosErr.message)) {
+      return "Error: KOSCOM 서버가 연결을 끊었습니다 (점검/장애 가능성). 잠시 후 다시 시도해주세요.";
     }
   }
 
@@ -23,8 +25,11 @@ export function handleApiError(error: unknown): string {
     if (error.message.startsWith("API_ERROR:")) {
       return error.message;
     }
-    if (error.message === "SESSION_ACQUIRE_FAILED") {
-      return "Error: 세션 획득 실패. KOSCOM 서버에서 세션 쿠키를 받지 못했습니다. 잠시 후 다시 시도해주세요.";
+    if (error.message.startsWith("KICPA_UPSTREAM_UNAVAILABLE:")) {
+      return `Error: ${error.message.replace(/^KICPA_UPSTREAM_UNAVAILABLE:\s*/, "")}`;
+    }
+    if (error.message.startsWith("SESSION_ACQUIRE_FAILED")) {
+      return "Error: 세션 획득 실패. KOSCOM 서버에서 세션 쿠키를 받지 못했습니다 (서버 점검/장애 가능성). 잠시 후 다시 시도해주세요.";
     }
   }
 
