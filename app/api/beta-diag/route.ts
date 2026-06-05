@@ -17,7 +17,7 @@ export async function GET(request: Request) {
 
   // 1) KOSPI 지수 엔드포인트 확인 (심볼 후보 비교)
   try {
-    const candidates = [kospiSymbol, "KOSPI", "KS11", "KPI200"];
+    const candidates = [kospiSymbol, "KS11"];
     const idx: Record<string, unknown> = {};
     for (const sym of [...new Set(candidates)]) {
       try {
@@ -70,18 +70,6 @@ export async function GET(request: Request) {
     });
   } catch (e) {
     out.computedAdjMode = { error: e instanceof Error ? e.message : String(e) };
-  }
-
-  // 4) 계산 결과: 원주가 정밀 모드 (005930)
-  try {
-    out.computedRawMode = await computeBetaData({
-      stockCodes: ["005930"],
-      date: baseDate,
-      kospiSymbol,
-      useRawPrices: true,
-    });
-  } catch (e) {
-    out.computedRawMode = { error: e instanceof Error ? e.message : String(e) };
   }
 
   // 5) 스크립트 대상 종목 (204840)
