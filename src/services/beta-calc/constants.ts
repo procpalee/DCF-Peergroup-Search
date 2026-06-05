@@ -26,6 +26,27 @@ export const PERIOD_SPECS: Record<BetaLabel, PeriodSpec> = {
 
 export const DEFAULT_PERIODS: BetaLabel[] = ["Weekly-2Y", "Monthly-5Y"];
 
+/**
+ * valuation_get_data 폴백용 전체 그리드 (Weekly/Monthly × 1/2/3/5Y).
+ * keepRows = 관측치 N + 1. N(52/104/156/260, 12/24/36/60)은 KICPA dataPoints와 일치.
+ */
+export type BetaKey = "1Y" | "2Y" | "3Y" | "5Y";
+export interface GridSpec {
+  periodType: PeriodType;
+  betaKey: BetaKey;
+  keepRows: number;
+}
+export const GRID_SPECS: GridSpec[] = [
+  { periodType: "Weekly", betaKey: "1Y", keepRows: 53 },
+  { periodType: "Weekly", betaKey: "2Y", keepRows: 105 },
+  { periodType: "Weekly", betaKey: "3Y", keepRows: 157 },
+  { periodType: "Weekly", betaKey: "5Y", keepRows: 261 },
+  { periodType: "Monthly", betaKey: "1Y", keepRows: 13 },
+  { periodType: "Monthly", betaKey: "2Y", keepRows: 25 },
+  { periodType: "Monthly", betaKey: "3Y", keepRows: 37 },
+  { periodType: "Monthly", betaKey: "5Y", keepRows: 61 },
+];
+
 /** 가장 긴 기간(5년) + 여유 버퍼만큼 과거 데이터를 한 번에 받는다 */
 export const LOOKBACK_DAYS = 5 * 365 + 250;
 

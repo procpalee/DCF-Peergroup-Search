@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { fetchBetaData } from "../kicpa/client";
+import { computeBetaGridBatch } from "../beta-calc";
 import { resolveCorpCode, getCompanyInfo } from "../common/stock-code-resolver";
 import { fetchFinancials, fetchStockQuantity, extractSharesInfo, extractNciAndPretax, extractDebtSummary } from "../opendart/client";
 import { REPORT_CODE } from "../opendart/constants";
@@ -10,7 +10,7 @@ import { handleApiError } from "../utils/error-handler";
 import { getCachedValuation } from "../cache/valuation-cache";
 import { getIndustryName } from "../opendart/ksic-codes";
 import type { DebtSummary } from "../opendart/types";
-import type { BetaValues, StockBetaResult } from "../kicpa/types";
+import type { StockBetaResult } from "../kicpa/types";
 
 // ─── 스키마 ───
 
@@ -65,8 +65,11 @@ export function registerValuationDataTool(server: McpServer): void {
     {
       title: "DCF 밸류에이션 데이터 조회",
       description: `DCF 밸류에이션에 필요한 핵심 데이터를 조회합니다.
-KICPA(베타) + OpenDART(XBRL/재무/주식수) + 네이버금융(종가)을 병렬 호출합니다.
+베타 + OpenDART(XBRL/재무/주식수) + 네이버금융(종가)을 병렬 호출합니다.
 최대 10개 종목을 한번에 배치 조회할 수 있습니다.
+
+[베타 출처] 평가기준일이 캐시된 분기말(예: 2025-03/06/09/12 말)이면 KICPA 공식 캐시값을 사용하고,
+그 외 임의 영업일이면 네이버 주가+KOSPI 회귀로 직접 계산(compute_beta 로직)합니다.
 
 [사전 확인 — 이 도구를 호출하기 전에 사용자에게 아래 정보를 확인하세요]
 1. 종목코드 또는 회사명
@@ -119,14 +122,9 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
         // 캐시 미스가 있을 때만 라이브 API 호출
         let liveResults: CompactResult[] = [];
         if (uncachedCodes.length > 0) {
-          // 1. 베타: 미스 종목만 배치 (2회 호출 — Weekly + Monthly)
-          const [betaWeeklyResult, betaMonthlyResult] = await Promise.allSettled([
-            fetchBetaData({ stockCodes: uncachedCodes, date: valuationDate, country: "KR", periodType: "Weekly", betaPeriods: ["1Y", "2Y", "3Y", "5Y"] }),
-            fetchBetaData({ stockCodes: uncachedCodes, date: valuationDate, country: "KR", periodType: "Monthly", betaPeriods: ["1Y", "2Y", "3Y", "5Y"] }),
-          ]);
-
-          const weeklyMap = indexBetaByCode(betaWeeklyResult);
-          const monthlyMap = indexBetaByCode(betaMonthlyResult);
+          // 1. 베타: 캐시(분기말)가 없는 기준일이므로 KICPA 대신 네이버 기반 직접 계산
+          //    (Weekly/Monthly × 1/2/3/5Y 전체 그리드)
+          const { weeklyMap, monthlyMap } = await computeBetaGridBatch(uncachedCodes, valuationDate);
 
           // 2. 미스 종목만 재무/주식수/시장/XBRL — 병렬
           liveResults = await Promise.all(uncachedCodes.map((code) => processCompany(code, year, apiKey, weeklyMap, monthlyMap)));
@@ -247,17 +245,6 @@ function formatDate(date: Date): string {
   const m = String(date.getMonth() + 1).padStart(2, "0");
   const d = String(date.getDate()).padStart(2, "0");
   return `${y}${m}${d}`;
-}
-
-/** 베타 결과 배열을 stockCode → result 맵으로 인덱싱 */
-function indexBetaByCode(result: PromiseSettledResult<StockBetaResult[]>): Map<string, StockBetaResult> {
-  const map = new Map<string, StockBetaResult>();
-  if (result.status === "fulfilled") {
-    for (const r of result.value) {
-      map.set(r.stockCode, r);
-    }
-  }
-  return map;
 }
 
 /** BetaValues → compact [raw, adjusted, dataPoints] 배열로 변환 */

@@ -1,6 +1,7 @@
-import type { BetaLabel, ComputedBeta, PricePoint } from "./types";
+import type { BetaLabel, AlignedRow, ComputedBeta, PricePoint } from "./types";
 import {
   DEFAULT_PERIODS,
+  GRID_SPECS,
   LOOKBACK_DAYS,
   MAX_COMPUTE_STOCKS,
   PERIOD_SPECS,
@@ -17,6 +18,7 @@ import {
 } from "./math";
 import { fetchAdjDaily, fetchKospiDaily } from "./data-source";
 import { fetchMarketData } from "../naver/client";
+import type { BetaValues, StockBetaResult } from "../kicpa/types";
 
 export interface ComputeBetaParams {
   stockCodes: string[];
@@ -136,6 +138,86 @@ export async function computeBetaData(
 /** KICPA 표기 정밀도에 맞춘 소수점 6자리 반올림 */
 function round6(x: number): number {
   return Math.round(x * 1e6) / 1e6;
+}
+
+/** 정렬된 행에서 한 (주기 × 기간) 셀의 BetaValues 산출 */
+function computeCell(
+  rows: AlignedRow[],
+  periodType: "Weekly" | "Monthly",
+  keepRows: number
+): BetaValues {
+  const resampled =
+    periodType === "Weekly"
+      ? resampleWeekly(rows, keepRows)
+      : resampleMonthly(rows, keepRows);
+  const { stockReturn, marketReturn } = computeReturns(resampled);
+  const { slope, rSquared, n } = ols(marketReturn, stockReturn);
+  if (!isFinite(slope)) return { raw: null, adjusted: null, dataPoints: null };
+  const rawBeta = round6(slope);
+  return { raw: rawBeta, adjusted: round6(adjustBeta(rawBeta)), dataPoints: n };
+}
+
+export interface BetaGridMaps {
+  weeklyMap: Map<string, StockBetaResult>;
+  monthlyMap: Map<string, StockBetaResult>;
+}
+
+/**
+ * valuation_get_data 폴백: Weekly/Monthly × 1/2/3/5Y 전체 그리드를 직접 계산해
+ * KICPA fetchBetaData 와 동일한 (weeklyMap, monthlyMap) 형태로 반환한다.
+ * 분기말 캐시가 없는(=비분기말 등) 기준일에 KICPA 대신 사용한다.
+ */
+export async function computeBetaGridBatch(
+  stockCodes: string[],
+  date: string,
+  kospiSymbol?: string
+): Promise<BetaGridMaps> {
+  const endDate = normalizeDate(date);
+  const startDate = formatYmd(
+    new Date(parseYmd(endDate).getTime() - LOOKBACK_DAYS * 86400000)
+  );
+
+  const weeklyMap = new Map<string, StockBetaResult>();
+  const monthlyMap = new Map<string, StockBetaResult>();
+
+  const marketSeries = await fetchKospiDaily(startDate, endDate, kospiSymbol).catch(
+    () => [] as PricePoint[]
+  );
+  if (marketSeries.length === 0) return { weeklyMap, monthlyMap };
+
+  await Promise.all(
+    stockCodes.map(async (code) => {
+      try {
+        const adj = await fetchAdjDaily(normalizeCode(code), startDate, endDate);
+        if (adj.length === 0) return;
+        const rows = buildAlignedRows(marketSeries, adj, adj);
+        const lastClose = adj[adj.length - 1]?.close ?? null;
+
+        const weeklyBetas: Record<string, BetaValues> = {};
+        const monthlyBetas: Record<string, BetaValues> = {};
+        for (const spec of GRID_SPECS) {
+          const bv = computeCell(rows, spec.periodType, spec.keepRows);
+          if (spec.periodType === "Weekly") weeklyBetas[spec.betaKey] = bv;
+          else monthlyBetas[spec.betaKey] = bv;
+        }
+
+        const base = {
+          stockCode: code,
+          stockNameKr: "",
+          stockNameEn: "",
+          market: "",
+          closePrice: lastClose !== null ? String(lastClose) : "",
+          date: endDate,
+        };
+        weeklyMap.set(code, { ...base, betas: weeklyBetas });
+        monthlyMap.set(code, { ...base, betas: monthlyBetas });
+      } catch {
+        // 종목 단위 실패는 무시 → 해당 종목 beta 는 null 로 남는다.
+      }
+    })
+  );
+
+  return { weeklyMap, monthlyMap };
 }
 
 /** 종목코드 정규화: 숫자만, 6자리 zero-pad */
