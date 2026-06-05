@@ -21,8 +21,8 @@ const ValuationDataInputSchema = z.object({
   ]).optional().describe("종목코드 6자리. 단일 문자열 또는 최대 10개 배열 (예: '005930' 또는 ['005930','005380'])"),
   stock_code: z.string().min(1).max(10).optional()
     .describe("단일 종목코드 6자리 (stock_codes 대신 사용 가능)"),
-  valuation_date: z.string().regex(/^\d{8}$/).optional()
-    .describe("평가기준일 YYYYMMDD (기본: 가장 최근 캐시된 날짜인 '20251231'). 베타 조회일 및 사업연도 결정에 사용"),
+  valuation_date: z.string().regex(/^\d{8}$/, "평가기준일은 YYYYMMDD 형식이어야 합니다")
+    .describe("⚠️[필수] 평가기준일 YYYYMMDD. 모를 경우 임의의 오늘 날짜를 넣지 말고 반드시 사용자에게 확인하세요. 베타 조회일 및 사업연도 결정에 사용"),
   year: z.string().regex(/^\d{4}$/).optional()
     .describe("재무제표 사업연도 YYYY. ⚠️주의: 반드시 평가기준일(valuation_date)과 동일한 연도를 입력해야 합니다! (예: 평가기준일이 20251231이면 무조건 2025 입력). 입력하지 않으면 평가기준일의 연도를 자동으로 산정합니다."),
   api_key: z.string().optional()
@@ -71,13 +71,14 @@ export function registerValuationDataTool(server: McpServer): void {
 [베타 출처] 평가기준일이 캐시된 분기말(예: 2025-03/06/09/12 말)이면 KICPA 공식 캐시값을 사용하고,
 그 외 임의 영업일이면 네이버 주가+KOSPI 회귀로 직접 계산(compute_beta 로직)합니다.
 
-[사전 확인 — 이 도구를 호출하기 전에 사용자에게 아래 정보를 확인하세요]
-1. 종목코드 또는 회사명
-2. 평가기준일 (YYYYMMDD)
+[⚠️ 필수 입력 — 둘 다 없으면 호출이 거부됩니다]
+1. 종목코드 (stock_codes 또는 stock_code). 회사명만 있으면 먼저 search_stock 으로 종목코드를 조회하세요.
+2. 평가기준일 (valuation_date, YYYYMMDD).
+→ 두 값을 모르면 추측하지 말고 반드시 사용자에게 먼저 확인한 뒤 호출하세요.
 
 [⚠️ AI를 위한 엄격한 파라미터 규칙]
 - year 파라미터는 특별한 지시가 없는 한 무조건 valuation_date 의 연도와 일치시켜야 합니다. (관습적으로 작년 재무제표를 조회하려 하지 마세요!)
-- valuation_date 를 모를 경우 임의로 라이브 날짜를 입력하지 말고 생략하세요. (서버가 가장 최신 캐시로 알아서 연결합니다)
+- valuation_date 는 필수입니다. 모를 경우 임의의 오늘 날짜를 넣지 말고 사용자에게 확인하세요.
 
 [반환 데이터 — compact JSON]
 - beta: Weekly/Monthly × 1Y/2Y/3Y/5Y — 값은 [실질베타, 조정베타, 포인트수] 배열
@@ -86,8 +87,8 @@ export function registerValuationDataTool(server: McpServer): void {
 - marketCap: { price, shares(유통주식수), total }
 
 [파라미터]
-- stock_codes: 종목코드 6자리 (단일 문자열 또는 최대 10개 배열)
-- valuation_date: 평가기준일 YYYYMMDD (기본: 가장 최근 캐시 일자)
+- stock_codes: 종목코드 6자리 (단일 문자열 또는 최대 10개 배열) — 필수
+- valuation_date: 평가기준일 YYYYMMDD — 필수
 - year: 재무제표 사업연도 (기본: 평가기준일 연도)
 
 [Peer 워크플로우 Step 4]
@@ -96,11 +97,18 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (params: ValuationDataInput) => {
+      // [필수 입력 검증] 종목 식별자 + 평가기준일
+      const missing: string[] = [];
       const rawCodes = params.stock_codes ?? params.stock_code;
-      if (!rawCodes) {
-        return { content: [{ type: "text" as const, text: "Error: stock_codes 또는 stock_code를 입력해야 합니다." }], isError: true };
+      if (!rawCodes) missing.push("종목코드(stock_codes 또는 stock_code) — 회사명만 있으면 search_stock 으로 종목코드를 먼저 조회하세요");
+      if (!params.valuation_date) missing.push("평가기준일(valuation_date, YYYYMMDD) — 사용자에게 확인 후 입력하세요");
+      if (!rawCodes || !params.valuation_date) {
+        return {
+          content: [{ type: "text" as const, text: `Error: DCF 기초자료 조회에 필요한 값이 누락되었습니다.\n- ${missing.join("\n- ")}` }],
+          isError: true,
+        };
       }
-      const valuationDate = params.valuation_date ?? "20251231";
+      const valuationDate = params.valuation_date;
       const year = params.year ?? valuationDate.slice(0, 4);
       const codes = Array.isArray(rawCodes) ? rawCodes : [rawCodes];
       const apiKey = params.api_key;
