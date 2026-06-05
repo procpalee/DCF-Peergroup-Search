@@ -7,6 +7,7 @@ import { registerNaverMarketDataTool } from "@/services/tools/naver-market-data"
 import { registerValuationDataTool } from "@/services/tools/valuation-data";
 import { registerSearchByIndustryTool } from "@/services/tools/search-by-industry";
 import { registerBusinessContentTool } from "@/services/tools/business-content";
+import { registerComputeBetaTool } from "@/services/tools/compute-beta";
 
 const handler = createMcpHandler(
   (server) => {
@@ -29,6 +30,9 @@ const handler = createMcpHandler(
 
     // 사업보고서 원문 마크다운 추출
     registerBusinessContentTool(server);
+
+    // 베타 직접 계산 (네이버 기반, KICPA 비의존)
+    registerComputeBetaTool(server);
   },
   {},
   {
