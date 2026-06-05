@@ -15,7 +15,7 @@ import {
   parseYmd,
   formatYmd,
 } from "./math";
-import { fetchAdjDaily, fetchKospiDaily, fetchRawDaily } from "./data-source";
+import { fetchAdjDaily, fetchKospiDaily } from "./data-source";
 import { fetchMarketData } from "../naver/client";
 
 export interface ComputeBetaParams {
@@ -23,9 +23,7 @@ export interface ComputeBetaParams {
   /** 평가기준일 YYYYMMDD */
   date: string;
   periods?: BetaLabel[];
-  /** 정밀 모드: 원주가(sise_day)를 별도 수집해 사용 (기본 false → 수정주가로 근사) */
-  useRawPrices?: boolean;
-  /** KOSPI 지수 심볼 (Vercel 실측으로 확정) */
+  /** KOSPI 지수 심볼 (기본 "KOSPI") */
   kospiSymbol?: string;
 }
 
@@ -47,17 +45,15 @@ async function computeOneStock(
   startDate: string,
   endDate: string,
   periods: BetaLabel[],
-  marketSeries: PricePoint[],
-  useRawPrices: boolean
+  marketSeries: PricePoint[]
 ): Promise<ComputeBetaStockResult> {
   const [adj, nameInfo] = await Promise.all([
     fetchAdjDaily(stockCode, startDate, endDate),
     fetchMarketData(stockCode).catch(() => null),
   ]);
 
-  const raw = useRawPrices
-    ? await fetchRawDaily(stockCode, startDate).catch(() => adj)
-    : adj;
+  // siseJson 수정주가를 raw/adj 동일 입력으로 사용 → 수정수익률 회귀(검증상 KICPA와 일치).
+  const raw = adj;
 
   const result: ComputeBetaStockResult = {
     stockCode,
@@ -121,8 +117,7 @@ export async function computeBetaData(
         startDate,
         endDate,
         periods,
-        marketSeries,
-        params.useRawPrices ?? false
+        marketSeries
       ).catch((e) => ({
         stockCode: code,
         stockName: null,

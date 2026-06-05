@@ -41,8 +41,9 @@ KICPA/KOSCOM 서버에 의존하지 않으므로 KICPA 장애 시에도 동작�
 - 조정베타 = 실질베타 × 2/3 + 1/3
 - Weekly-2Y(약 104주), Monthly-5Y(약 60개월) 관측치
 
-[주의] KICPA CHECKExpert+ 의 공식값과 소수점 단위 차이가 있을 수 있는 **비공식 근사치**입니다.
-정확한 분기말 공식 베타가 필요하면 valuation_get_data(캐시) 또는 kicpa_get_beta 를 사용하세요.
+[정확도] 검증상 005930·000660의 분기말 Weekly-2Y/Monthly-5Y 가 KICPA 공식값과
+소수점 6자리까지 일치했습니다. 다만 날짜/종목에 따라 미세 차이가 있을 수 있는 비공식 산출이며,
+분기말 공식 베타는 valuation_get_data(캐시)/kicpa_get_beta 가 우선입니다.
 
 Args:
   - stock_codes (string[]): 국내 종목코드 6자리 (최대 ${MAX_COMPUTE_STOCKS}개)

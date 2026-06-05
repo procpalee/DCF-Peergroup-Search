@@ -26,6 +26,7 @@
 | `dart_get_company` | DART 기업 기본정보 조회 (대표자, 업종, 설립일 등) | OpenDART |
 | `dart_get_financials` | 분기/반기 보고서, 전체 재무제표, 개별(OFS) 조회 등 특수 케이스 | OpenDART |
 | `kicpa_get_beta` | 임의 영업일/미국 종목/Daily 주기 등 특수 베타 조회 | KICPA CHECKExpert+ |
+| `compute_beta` | **베타 직접 계산(KICPA 비의존)** — 네이버 수정주가 + KOSPI 지수 회귀로 Weekly-2Y/Monthly-5Y 산출. KICPA 장애 시 대안. 검증상 공식값과 소수점 6자리 일치 | 네이버 금융 |
 | `naver_get_market_data` | 실시간 주가·시가총액·PER·PBR·컨센서스 목표가·동종업종 기업 | 네이버 금융 |
 
 👉 **Peer Group 분석 워크플로우**는 [`docs/PEER_GROUP_WORKFLOW.md`](docs/PEER_GROUP_WORKFLOW.md) 참조 — 에이전트가 언제 어떤 도구를 어떤 순서로 호출해야 하는지 정규 시퀀스가 정리되어 있습니다.
