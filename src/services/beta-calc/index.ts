@@ -78,10 +78,13 @@ async function computeOneStock(
     const { stockReturn, marketReturn } = computeReturns(resampled);
     const { slope, rSquared, n } = ols(marketReturn, stockReturn);
     if (isFinite(slope)) {
+      // KICPA 보고 정밀도(소수점 6자리)에 맞춰 반올림.
+      // 조정베타는 '반올림된 실질베타'에서 산출 → KICPA 표기와 정확히 일치.
+      const rawBeta = round6(slope);
       result.results[label] = {
-        raw: slope,
-        adjusted: adjustBeta(slope),
-        rSquared,
+        raw: rawBeta,
+        adjusted: round6(adjustBeta(rawBeta)),
+        rSquared: round6(rSquared),
         dataPoints: n,
       };
     }
@@ -128,6 +131,11 @@ export async function computeBetaData(
     )
   );
   return results;
+}
+
+/** KICPA 표기 정밀도에 맞춘 소수점 6자리 반올림 */
+function round6(x: number): number {
+  return Math.round(x * 1e6) / 1e6;
 }
 
 /** 종목코드 정규화: 숫자만, 6자리 zero-pad */
