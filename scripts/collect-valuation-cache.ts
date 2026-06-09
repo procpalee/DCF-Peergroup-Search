@@ -27,10 +27,10 @@ import type { DebtSummary } from "../src/services/opendart/types";
 
 // ─── 설정 ───
 
-// 2026-03-31 평가기준일: 최신 사업보고서는 2025 연간. 2025 분기말은 이미 캐시되어 있으므로
-// 이번 실행 대상은 20260331 만. (다른 분기 추가 시 배열에 날짜를 더하면 됨)
+// 2025 분기말 캐시는 이미 생성되어 있음(data/valuation-cache/2025*.json). 재생성/신규 분기
+// 추가 시에만 이 스크립트를 실행한다. 베타는 네이버+KOSPI 직접계산(KICPA 제거됨).
 const FISCAL_YEAR = "2025";
-const VALUATION_DATES = ["20260331"];
+const VALUATION_DATES = ["20250331", "20250630", "20250930", "20251231"];
 const DART_BATCH_SIZE = 3;
 const DART_DELAY_MS = 1000;    // 분당 ~180회 (안전)
 const NAVER_CONCURRENCY = 10;
