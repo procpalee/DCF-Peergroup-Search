@@ -33,8 +33,8 @@
 
 > **평가기준일(`valuation_date`)이 분기말(0331 / 0630 / 0930 / 1231)이라면, `valuation_get_data` 한 번 호출로 베타 + 이자부부채 + 비지배지분 + 세전이익 + 시가총액이 전부 나옵니다.**
 
-이 경우 `kicpa_get_beta`, `dart_get_financials`, `naver_get_market_data`를 따로 호출할 이유가 **없습니다**. 따로 부르면:
-- ❌ 라이브 API 3곳(KICPA, DART, 네이버)을 불필요하게 호출
+이 경우 `compute_beta`, `dart_get_financials`, `naver_get_market_data`를 따로 호출할 이유가 **없습니다**. 따로 부르면:
+- ❌ 라이브 소스(네이버, DART)를 불필요하게 호출
 - ❌ 응답이 10배 이상 느려짐
 - ❌ 캐시된 값과 미세한 수치 차이 발생 가능
 
@@ -152,10 +152,9 @@ valuation_get_data(
 | 베타 (분기말) | ✅ 캐시 | `valuation_get_data(valuation_date=YYYY{0331,0630,0930,1231})` |
 | 이자부부채 / NCI / 세전이익 (분기말) | ✅ 캐시 | `valuation_get_data` 동일 호출 |
 | 시가총액 (분기말) | ✅ 캐시 | `valuation_get_data` 동일 호출 |
-| **임의 영업일** 베타 | ❌ 라이브 | `kicpa_get_beta` |
+| **임의 영업일** 베타 | 🧮 직접계산 | `valuation_get_data`(베타 자동 직접계산) 또는 `compute_beta` |
 | **당일** 주가·PER·PBR·컨센서스 | ❌ 라이브 | `naver_get_market_data` |
 | 분기/반기 보고서 재무, 전체 계정 | ❌ 라이브 | `dart_get_financials` |
-| 미국 종목 베타 | ❌ 라이브 | `kicpa_get_beta(country="US")` |
 | 사업연도 2025 외 (예: 2023 사업보고서) | ❌ 라이브 | `get_business_content(year="2023")` (DART 실시간 다운로드) |
 
 캐시 miss가 발생하면 각 도구가 **자동으로** 라이브 API 폴백을 수행합니다 (워크플로우 #6). 에이전트가 별도 처리할 필요는 없습니다.
@@ -166,9 +165,9 @@ valuation_get_data(
 
 | ❌ 나쁜 예 | ✅ 좋은 예 |
 |---|---|
-| Peer 5개에 대해 `kicpa_get_beta` + `dart_get_financials` + `naver_get_market_data` 각각 호출 | `valuation_get_data(stock_codes=[...5개], valuation_date="20251231")` 한 번 |
+| Peer 5개에 대해 `compute_beta` + `dart_get_financials` + `naver_get_market_data` 각각 호출 | `valuation_get_data(stock_codes=[...5개], valuation_date="20251231")` 한 번 |
 | `get_business_content`를 5개 종목에 동시에 배치 호출 | 한 종목씩, 판단 후 다음 종목 |
-| `valuation_date="20251101"` 같은 임의 평일 | 분기말 `"20251231"` 사용 |
+| 분기말이면 더 빠름(캐시) — 임의 평일은 직접계산이라 다소 느릴 수 있음 | 가능하면 분기말 기준일 사용 |
 | `valuation_date="20251231"` + `year="2024"` | `year="2025"` (연도 일치) |
 | "Peer 30개 다 뽑아서 데이터 비교" | Step 3에서 5~10개로 좁힌 뒤 Step 4 |
 | Step 2 없이 `search_stock` 결과만으로 Peer 선정 | `search_by_industry`로 업종 기반 후보군 먼저 확보 |
@@ -189,9 +188,9 @@ valuation_get_data(
 4. `get_business_content(stock_code="<후보1>", year="2025")` × 10 회 (순차 호출)
    → 메모리·시스템·장비 구분해서 삼성전자와 겹치는 메모리 반도체 Peer 5개 확정
 5. `valuation_get_data(stock_codes=["000660","042700","240810","005070","<피어5>"], valuation_date="20251231", year="2025")`
-6. 반환된 JSON을 파싱해서 Weekly 5Y 조정베타 평균·중앙값, IBD 합계, 시총 합계를 표로 정리
+6. 반환된 JSON을 파싱해서 Weekly-2Y / Monthly-5Y 조정베타 평균·중앙값, IBD 합계, 시총 합계를 표로 정리
 
-**절대 호출하지 말 것**: `kicpa_get_beta`, `dart_get_financials`, `naver_get_market_data`
+**절대 호출하지 말 것**: `dart_get_financials`, `naver_get_market_data` (valuation_get_data 가 모두 포함)
 
 ### 예시 2 — 특정 회사 사업 내용만 빠르게
 
@@ -203,15 +202,15 @@ valuation_get_data(
 
 (Peer Group 워크플로우 과잉 적용 금지.)
 
-### 예시 3 — 임의 평일 베타가 필요한 예외
+### 예시 3 — 임의 평일 베타
 
 **사용자 프롬프트**
-> 005930의 2025-08-15 기준 Daily 1Y 베타 알려줘.
+> 005930의 2025-08-15 기준 베타 알려줘.
 
 **에이전트 호출 시퀀스**
-1. `kicpa_get_beta(stock_codes=["005930"], date="20250815", period_type="Daily", beta_periods=["1Y"])`
+1. `compute_beta(stock_codes=["005930"], base_date="2025-08-15")` → Weekly-2Y, Monthly-5Y 직접계산
 
-(이 경우만 `kicpa_get_beta`를 직접 사용. `valuation_get_data`는 분기말 캐시만 제공하므로 부적합.)
+(분기말이 아니면 `valuation_get_data` 도 베타를 직접계산해 반환합니다. 베타만 빠르게 보려면 `compute_beta`.)
 
 ---
 

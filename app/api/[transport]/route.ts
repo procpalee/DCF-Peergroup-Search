@@ -1,5 +1,4 @@
 import { createMcpHandler } from "mcp-handler";
-import { registerGetBetaTool } from "@/services/tools/get-beta";
 import { registerSearchStockTool } from "@/services/tools/search-stock";
 import { registerDartCompanyTool } from "@/services/tools/dart-company";
 import { registerDartFinancialsTool } from "@/services/tools/dart-financials";
@@ -11,8 +10,6 @@ import { registerComputeBetaTool } from "@/services/tools/compute-beta";
 
 const handler = createMcpHandler(
   (server) => {
-    // KICPA (기존)
-    registerGetBetaTool(server);
     registerSearchStockTool(server);
 
     // OpenDART (신규)

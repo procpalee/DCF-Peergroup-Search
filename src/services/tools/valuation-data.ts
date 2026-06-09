@@ -81,7 +81,7 @@ export function registerValuationDataTool(server: McpServer): void {
 - valuation_date 는 필수입니다. 모를 경우 임의의 오늘 날짜를 넣지 말고 사용자에게 확인하세요.
 
 [반환 데이터 — compact JSON]
-- beta: Weekly/Monthly × 1Y/2Y/3Y/5Y — 값은 [실질베타, 조정베타, 포인트수] 배열
+- beta: Weekly-2Y, Monthly-5Y — 값은 [실질베타, 조정베타, 포인트수] 배열
 - ibd: 유동/비유동 세부계정 — 값은 [계정명, 금액] 튜플
 - nci: 비지배지분, pretaxIncome: 세전이익
 - marketCap: { price, shares(유통주식수), total }
@@ -92,7 +92,7 @@ export function registerValuationDataTool(server: McpServer): void {
 - year: 재무제표 사업연도 (기본: 평가기준일 연도)
 
 [Peer 워크플로우 Step 4]
-Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호출하세요. valuation_date 를 분기말(YYYY0331/0630/0930/1231)로 지정하면 2,617 종목에 대해 100% 캐시 히트로 즉시 응답합니다. 이 도구 하나가 베타(Weekly/Monthly × 1Y/2Y/3Y/5Y) + 이자부부채(유동/비유동) + 비지배지분 + 세전이익 + 시가총액(price/shares/total) 을 모두 반환하므로, 같은 용도로 kicpa_get_beta / dart_get_financials / naver_get_market_data 를 따로 호출하지 마세요. 상세는 docs/PEER_GROUP_WORKFLOW.md 참조.`,
+Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호출하세요. 캐시된 분기말은 즉시 응답하고, 캐시되지 않은 분기말/영업일은 베타를 네이버+KOSPI 회귀로 직접 계산해 반환합니다. 이 도구 하나가 베타(Weekly-2Y, Monthly-5Y) + 이자부부채(유동/비유동) + 비지배지분 + 세전이익 + 시가총액(price/shares/total) 을 모두 반환하므로, 같은 용도로 dart_get_financials / naver_get_market_data 를 따로 호출하지 마세요. 상세는 docs/PEER_GROUP_WORKFLOW.md 참조.`,
       inputSchema: ValuationDataInputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -142,7 +142,8 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
         const resultMap = new Map<string, CompactResult>();
         for (const r of cached) resultMap.set(r.code, r);
         for (const r of liveResults) resultMap.set(r.code, r);
-        const results = codes.map((code) => resultMap.get(code)!);
+        // 베타는 Weekly-2Y, Monthly-5Y 두 가지만 노출 (기존 캐시 파일은 그대로 두되 출력만 축소)
+        const results = codes.map((code) => pickBeta(resultMap.get(code)!));
 
         // 4. 응답: 단일이면 객체, 다중이면 배열
         const output = results.length === 1 ? results[0] : results;
@@ -247,6 +248,19 @@ async function processCompany(
 }
 
 // ─── 유틸리티 ───
+
+/** 베타 출력을 Weekly-2Y, Monthly-5Y 두 가지로만 축소 (기존 캐시 파일은 보존) */
+function pickBeta(r: CompactResult): CompactResult {
+  const w = r.beta.weekly?.["2Y"];
+  const m = r.beta.monthly?.["5Y"];
+  return {
+    ...r,
+    beta: {
+      weekly: w ? { "2Y": w } : null,
+      monthly: m ? { "5Y": m } : null,
+    },
+  };
+}
 
 function formatDate(date: Date): string {
   const y = date.getFullYear();

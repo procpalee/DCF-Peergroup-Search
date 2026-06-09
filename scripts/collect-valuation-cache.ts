@@ -7,7 +7,7 @@
  * 단계:
  *   1. DART 재무 데이터 수집 (IBD, NCI, 세전이익, 주식수) — 1회, 공유
  *   2. 종가 수집 (날짜별, 네이버금융)
- *   3. 베타 수집 (날짜별, KICPA)
+ *   3. 베타 직접계산 (날짜별, 네이버 주가 + KOSPI 회귀 — Weekly-2Y/Monthly-5Y)
  *   4. 조립 → 날짜별 JSON 캐시 파일 생성
  *   5. 검증
  *
@@ -21,18 +21,20 @@ import { fetchFinancials, fetchStockQuantity, extractSharesInfo, extractNciAndPr
 import { extractDebtFromXbrl } from "../src/services/opendart/xbrl-parser";
 import { REPORT_CODE } from "../src/services/opendart/constants";
 import { fetchHistoricalPrices } from "../src/services/naver/client";
-import { fetchBetaData } from "../src/services/kicpa/client";
+import { computeBetaGridBatch } from "../src/services/beta-calc";
 import { getIndustryName } from "../src/services/opendart/ksic-codes";
 import type { DebtSummary } from "../src/services/opendart/types";
 
 // ─── 설정 ───
 
+// 2026-03-31 평가기준일: 최신 사업보고서는 2025 연간. 2025 분기말은 이미 캐시되어 있으므로
+// 이번 실행 대상은 20260331 만. (다른 분기 추가 시 배열에 날짜를 더하면 됨)
 const FISCAL_YEAR = "2025";
-const VALUATION_DATES = ["20250331", "20250630", "20250930", "20251231"];
+const VALUATION_DATES = ["20260331"];
 const DART_BATCH_SIZE = 3;
 const DART_DELAY_MS = 1000;    // 분당 ~180회 (안전)
 const NAVER_CONCURRENCY = 10;
-const KICPA_BATCH_SIZE = 20;
+const BETA_BATCH_SIZE = 20;    // 베타 직접계산 배치 크기
 const SAVE_INTERVAL = 50;
 
 const BASE_DIR = path.resolve(__dirname, "../data/valuation-cache");
@@ -243,20 +245,12 @@ async function collectBetas(
 
   const codes = toFetch.map((s) => s.code);
 
-  for (let i = 0; i < codes.length; i += KICPA_BATCH_SIZE) {
-    const batch = codes.slice(i, i + KICPA_BATCH_SIZE);
+  for (let i = 0; i < codes.length; i += BETA_BATCH_SIZE) {
+    const batch = codes.slice(i, i + BETA_BATCH_SIZE);
 
     try {
-      const [wResult, mResult] = await Promise.allSettled([
-        fetchBetaData({ stockCodes: batch, date: valuationDate, country: "KR", periodType: "Weekly", betaPeriods: ["1Y", "2Y", "3Y", "5Y"] }),
-        fetchBetaData({ stockCodes: batch, date: valuationDate, country: "KR", periodType: "Monthly", betaPeriods: ["1Y", "2Y", "3Y", "5Y"] }),
-      ]);
-
-      const weeklyResults = wResult.status === "fulfilled" ? wResult.value : [];
-      const monthlyResults = mResult.status === "fulfilled" ? mResult.value : [];
-
-      const weeklyMap = new Map(weeklyResults.map((r) => [r.stockCode, r]));
-      const monthlyMap = new Map(monthlyResults.map((r) => [r.stockCode, r]));
+      // 네이버 주가 + KOSPI 회귀로 직접 계산 (Weekly-2Y, Monthly-5Y)
+      const { weeklyMap, monthlyMap } = await computeBetaGridBatch(batch, valuationDate);
 
       for (const code of batch) {
         const w = weeklyMap.get(code);
@@ -273,7 +267,7 @@ async function collectBetas(
       }
     }
 
-    const done = Math.min(i + KICPA_BATCH_SIZE, codes.length);
+    const done = Math.min(i + BETA_BATCH_SIZE, codes.length);
     if (done % (SAVE_INTERVAL) === 0 || done >= codes.length) {
       saveJson(progressPath, existing);
       console.log(`[BETA ${valuationDate}] ${done}/${codes.length}`);

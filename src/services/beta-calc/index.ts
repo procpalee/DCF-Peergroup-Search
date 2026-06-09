@@ -6,7 +6,6 @@ import {
   MAX_COMPUTE_STOCKS,
   PERIOD_SPECS,
 } from "./constants";
-import type { BetaKey } from "./constants";
 import {
   buildAlignedRows,
   resampleWeekly,
@@ -219,48 +218,6 @@ export async function computeBetaGridBatch(
   );
 
   return { weeklyMap, monthlyMap };
-}
-
-/**
- * kicpa_get_beta 폴백: KOSCOM 베타 조회 실패 시 동일한 StockBetaResult[] 형태로
- * 직접 계산값을 반환한다. 국내(KR) Weekly/Monthly 만 지원(US/Daily 는 미지원).
- */
-export async function computeBetaResults(params: {
-  stockCodes: string[];
-  date: string;
-  periodType: "Weekly" | "Monthly";
-  betaPeriods: BetaKey[];
-  kospiSymbol?: string;
-}): Promise<StockBetaResult[]> {
-  const { weeklyMap, monthlyMap } = await computeBetaGridBatch(
-    params.stockCodes,
-    params.date,
-    params.kospiSymbol
-  );
-  const map = params.periodType === "Weekly" ? weeklyMap : monthlyMap;
-  const wanted = new Set(params.betaPeriods);
-  const endDate = normalizeDate(params.date);
-
-  return params.stockCodes.map((code) => {
-    const r = map.get(code);
-    const betas: Record<string, BetaValues> = {};
-    if (r) {
-      for (const [k, v] of Object.entries(r.betas)) {
-        if (wanted.has(k as BetaKey)) betas[k] = v;
-      }
-    }
-    return r
-      ? { ...r, betas }
-      : {
-          stockCode: code,
-          stockNameKr: "",
-          stockNameEn: "",
-          market: "",
-          closePrice: "",
-          date: endDate,
-          betas: {},
-        };
-  });
 }
 
 /** 종목코드 정규화: 숫자만, 6자리 zero-pad */

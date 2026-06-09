@@ -27,8 +27,8 @@ export const PERIOD_SPECS: Record<BetaLabel, PeriodSpec> = {
 export const DEFAULT_PERIODS: BetaLabel[] = ["Weekly-2Y", "Monthly-5Y"];
 
 /**
- * valuation_get_data 폴백용 전체 그리드 (Weekly/Monthly × 1/2/3/5Y).
- * keepRows = 관측치 N + 1. N(52/104/156/260, 12/24/36/60)은 KICPA dataPoints와 일치.
+ * 분기말 캐시/밸류에이션용 베타 조합. 요구사항에 따라 Weekly-2Y, Monthly-5Y 두 가지만 산출한다.
+ * keepRows = 관측치 N + 1. (N: 주간 104, 월간 60 — KICPA dataPoints와 일치)
  */
 export type BetaKey = "1Y" | "2Y" | "3Y" | "5Y";
 export interface GridSpec {
@@ -37,13 +37,7 @@ export interface GridSpec {
   keepRows: number;
 }
 export const GRID_SPECS: GridSpec[] = [
-  { periodType: "Weekly", betaKey: "1Y", keepRows: 53 },
   { periodType: "Weekly", betaKey: "2Y", keepRows: 105 },
-  { periodType: "Weekly", betaKey: "3Y", keepRows: 157 },
-  { periodType: "Weekly", betaKey: "5Y", keepRows: 261 },
-  { periodType: "Monthly", betaKey: "1Y", keepRows: 13 },
-  { periodType: "Monthly", betaKey: "2Y", keepRows: 25 },
-  { periodType: "Monthly", betaKey: "3Y", keepRows: 37 },
   { periodType: "Monthly", betaKey: "5Y", keepRows: 61 },
 ];
 
