@@ -1,6 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { fetchBetaData } from "../kicpa/client";
+import { computeBetaResults } from "../beta-calc";
+import type { StockBetaResult } from "../kicpa/types";
 import { handleApiError } from "../utils/error-handler";
 import { formatBetaResultsMarkdown, formatBetaResultsJson, formatBetaResultsTable } from "../utils/formatters";
 import { MAX_STOCK_CODES } from "../kicpa/constants";
@@ -42,6 +44,9 @@ export function registerGetBetaTool(server: McpServer): void {
 - 조정베타 (Adjusted Beta): 실질베타 × 2/3 + 1/3 으로 산출
 - 대표지수: 국내 KOSPI, 미국 S&P500
 
+[자동 폴백] KOSCOM(KICPA) 서버 장애로 조회가 실패하면, 국내(KR) Weekly/Monthly 요청은
+네이버 주가+KOSPI 회귀 직접계산값으로 자동 대체됩니다(US/Daily 는 미지원 → 원래 에러 반환).
+
 Args:
   - stock_codes (string[]): 종목코드 배열 (최대 20개). 국내 6자리, 미국 티커
   - date (string, optional): 조회일자 YYYYMMDD
@@ -68,14 +73,31 @@ Examples:
     async (params: GetBetaInput) => {
       try {
         const defaultDate = formatDateToYYYYMMDD(new Date());
+        const queryDate = params.date ?? defaultDate;
 
-        const results = await fetchBetaData({
-          stockCodes: params.stock_codes,
-          date: params.date ?? defaultDate,
-          country: params.country,
-          periodType: params.period_type,
-          betaPeriods: params.beta_periods,
-        });
+        // KOSCOM(KICPA) 조회를 우선 시도하고, 실패하면 즉시 네이버 기반 직접계산으로 폴백.
+        // 직접계산은 국내(KR) Weekly/Monthly 만 지원하므로 US/Daily 는 폴백 불가 → 원래 에러를 노출.
+        let results: StockBetaResult[];
+        let computedFallback = false;
+        try {
+          results = await fetchBetaData({
+            stockCodes: params.stock_codes,
+            date: queryDate,
+            country: params.country,
+            periodType: params.period_type,
+            betaPeriods: params.beta_periods,
+          });
+        } catch (kicpaError) {
+          const canCompute = params.country === "KR" && params.period_type !== "Daily";
+          if (!canCompute) throw kicpaError;
+          results = await computeBetaResults({
+            stockCodes: params.stock_codes,
+            date: queryDate,
+            periodType: params.period_type as "Weekly" | "Monthly",
+            betaPeriods: params.beta_periods,
+          });
+          computedFallback = true;
+        }
 
         if (results.length === 0) {
           return {
@@ -93,6 +115,13 @@ Examples:
           text = formatBetaResultsTable(results);
         } else {
           text = formatBetaResultsMarkdown(results);
+        }
+
+        // 폴백으로 직접계산된 경우 사용자가 출처를 알 수 있도록 안내(json 은 파싱 보존 위해 제외).
+        if (computedFallback && params.response_format !== "json") {
+          text =
+            "⚠️ KOSCOM(KICPA) 베타 서버 장애로 네이버 주가+KOSPI 회귀 **직접계산값**으로 대체했습니다(비공식 근사).\n\n" +
+            text;
         }
 
         return {
