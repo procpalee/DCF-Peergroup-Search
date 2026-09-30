@@ -6,7 +6,8 @@ import { fetchMarketData, fetchHistoricalPrices } from "../naver/client";
 import { handleApiError } from "../utils/error-handler";
 import { getCachedValuation } from "../cache/valuation-cache";
 import { getIndustryName } from "../opendart/ksic-codes";
-import { sanitizeShares } from "../opendart/ibd-engine";
+import { sanitizeShares, type CompactIbd } from "../opendart/ibd-engine";
+import { formatIbd, type IbdOutput } from "../valuation/ibd-output";
 import { resolveAsOfFinancials, type FinResult } from "../valuation/asof-financials";
 import type { StockBetaResult } from "../kicpa/types";
 
@@ -23,6 +24,8 @@ const ValuationDataInputSchema = z.object({
     .describe("⚠️[필수] 평가기준일 YYYYMMDD. 모를 경우 임의의 오늘 날짜를 넣지 말고 반드시 사용자에게 확인하세요. 베타 조회일 및 사업연도 결정에 사용"),
   year: z.string().regex(/^\d{4}$/).optional()
     .describe("(사용하지 않음 — 하위호환용) 재무 보고서는 평가기준일 당시 공시된 최신 정기보고서로 자동 선택됩니다."),
+  ibd_detail: z.boolean().optional()
+    .describe("true 면 이자부부채를 계정 행 단위(ibd.lines: [계정명, 금액, 범주])까지 반환. 기본 false — 총액·구역별/범주별 소계만"),
   api_key: z.string().optional()
     .describe("OpenDART API 키 (미입력 시 서버 환경변수 사용)"),
 });
@@ -36,18 +39,6 @@ interface CompactBeta {
   monthly: Record<string, [number | null, number | null, number | null]> | null;
 }
 
-interface CompactIBD {
-  current: [string, number][];
-  nonCurrent: [string, number][];
-  total: number;
-  /** 합계에서 뺀 부채성 항목(상환전환우선주부채·신종자본증권 등) */
-  debtLike?: [string, number][];
-  /** 산정 경고 — 원문 확인이 필요한 경우 */
-  checks?: string[];
-  /** 참고 — 정상 처리지만 알아 둘 사항(주석 보충 적용 등) */
-  notes?: string[];
-}
-
 export interface CompactResult {
   code: string;
   name: string | null;
@@ -56,7 +47,7 @@ export interface CompactResult {
   year: string | null;
   valuationDate: string;
   beta: CompactBeta;
-  ibd: CompactIBD | null;
+  ibd: IbdOutput | null;
   /** 금융업 등 이자부부채를 산정하지 않은 사유 */
   ibdExcluded?: string;
   nci: number | null;
@@ -66,6 +57,9 @@ export interface CompactResult {
   financials?: ({ report: { rceptNo: string; name: string; filedDate: string; period: string; fs: string | null } } & Record<string, unknown>) | null;
   derived?: { netDebt: number; enterpriseValue: number | null; note: string };
 }
+
+/** 캐시·라이브 계산 결과(출력 전) — 이자부부채는 행 단위 전체(CompactIbd, 옛 캐시는 2-튜플) */
+export type StoredResult = Omit<CompactResult, "ibd" | "derived"> & { ibd: CompactIbd | null };
 
 // ─── 도구 등록 ───
 
@@ -88,7 +82,9 @@ export function registerValuationDataTool(server: McpServer): void {
 
 [반환 데이터 — compact JSON]
 - beta: Weekly-2Y, Monthly-5Y — [실질베타, 조정베타, 포인트수]
-- ibd: 이자부부채 유동/비유동 [계정명, 금액] — 재무상태표 본문 기준, 차입금이 '금융부채'로 묶인 회사는 주석 금액으로 보충.
+- ibd: 이자부부채 — 기본은 요약: total(총액), current/nonCurrent([범주명, 금액] — 차입금·사채·리스부채·기타 차입성 부채),
+  byCategory(범주별 합계 — 예: 리스 제외 = total − byCategory.lease). ibd_detail=true 면 lines 에 계정 행 단위 [계정명, 금액, 범주].
+  재무상태표 본문 기준, 차입금이 '금융부채'로 묶인 회사는 주석 금액으로 보충. 차감계정(사채할인발행차금 등)은 본계정 범주에 음수로 합산.
   debtLike(상환전환우선주부채·신종자본증권 등)는 합계에서 제외해 따로 표시, checks 는 원문 확인이 필요한 경고, notes 는 참고.
   금융업(은행·보험·증권·금융지주)은 ibd=null 이고 ibdExcluded 에 사유.
 - nci: 비지배지분, pretaxIncome: 세전이익
@@ -119,20 +115,20 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
 
       try {
         // 0. 캐시 우선 조회
-        const cached: CompactResult[] = [];
+        const cached: StoredResult[] = [];
         const uncachedCodes: string[] = [];
 
         for (const code of codes) {
           const hit = await getCachedValuation(code, valuationDate);
           if (hit) {
-            cached.push(hit as CompactResult);
+            cached.push(hit);
           } else {
             uncachedCodes.push(code);
           }
         }
 
         // 캐시 미스가 있을 때만 라이브 API 호출
-        let liveResults: CompactResult[] = [];
+        let liveResults: StoredResult[] = [];
         if (uncachedCodes.length > 0) {
           // 1. 베타: 캐시(분기말)가 없는 기준일이므로 KICPA 대신 네이버 기반 직접 계산
           //    (Weekly/Monthly × 1/2/3/5Y 전체 그리드)
@@ -143,11 +139,11 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
         }
 
         // 3. 캐시 + 라이브 결과 병합 (요청 순서 유지)
-        const resultMap = new Map<string, CompactResult>();
+        const resultMap = new Map<string, StoredResult>();
         for (const r of cached) resultMap.set(r.code, r);
         for (const r of liveResults) resultMap.set(r.code, r);
         // 베타는 Weekly-2Y, Monthly-5Y 두 가지만 노출 (기존 캐시 파일은 그대로 두되 출력만 축소)
-        const results = codes.map((code) => finalize(resultMap.get(code)!));
+        const results = codes.map((code) => finalize(resultMap.get(code)!, params.ibd_detail ?? false));
 
         // 4. 응답: 단일이면 객체, 다중이면 배열
         const output = results.length === 1 ? results[0] : results;
@@ -173,7 +169,7 @@ async function processCompany(
   apiKey: string | undefined,
   weeklyMap: Map<string, StockBetaResult>,
   monthlyMap: Map<string, StockBetaResult>,
-): Promise<CompactResult> {
+): Promise<StoredResult> {
   const corpCode = await resolveCorpCode(code);
   const start = shiftDays(valuationDate, -14);
 
@@ -253,8 +249,9 @@ async function processCompany(
 
 // ─── 유틸리티 ───
 
-/** 베타 출력을 Weekly-2Y, Monthly-5Y 두 가지로만 축소하고, 순차입금·EV 보조값을 붙인다 */
-function finalize(r: CompactResult): CompactResult {
+/** 베타 출력을 Weekly-2Y, Monthly-5Y 두 가지로만 축소하고, 이자부부채 요약/상세를 만들고, 순차입금·EV 보조값을 붙인다 */
+function finalize(s: StoredResult, ibdDetail: boolean): CompactResult {
+  const r: CompactResult = { ...s, ibd: formatIbd(s.ibd, ibdDetail) };
   const w = r.beta.weekly?.["2Y"];
   const m = r.beta.monthly?.["5Y"];
   const cash = (r.financials?.cash ?? null) as number | null;

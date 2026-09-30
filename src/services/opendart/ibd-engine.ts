@@ -36,11 +36,16 @@ export function migrateIbdMessages<T extends { checks?: string[]; notes?: string
 export type IbdCategory = "borrowings" | "bonds" | "lease" | "otherDebt" | "contra";
 export type IbdSection = "current" | "nonCurrent" | "unclassified";
 
+/** 출력 범주 — 차감계정은 딸린 본계정의 범주로 합산한다 */
+export type IbdOutCategory = Exclude<IbdCategory, "contra">;
+
 export interface IbdLine {
   account: string;
   amount: number;
   category: IbdCategory;
   accountId: string;
+  /** 차감계정(contra)이 차감하는 본계정 범주 — 바로 앞 이자부부채 행 기준 */
+  netOf?: IbdOutCategory;
 }
 
 export interface IbdV2Result {
@@ -253,6 +258,10 @@ export function computeIbdV2(items: DartFinancialItem[], opts: IbdEngineOptions 
     // 차감계정은 표시 부호와 무관하게 음수로
     const signed = cat === "contra" ? -Math.abs(amt) : amt;
     const line: IbdLine = { account: r.account_nm.trim(), amount: signed, category: cat, accountId: id };
+    if (cat === "contra") {
+      const prev = [...res[section]].reverse().find((l) => l.category !== "contra");
+      line.netOf = prev ? (prev.category as IbdOutCategory) : guessCategoryByName(name);
+    }
     res[section].push(line);
     res.total += signed;
   }
@@ -365,17 +374,67 @@ export function applyXbrlSupplement(res: IbdV2Result, x: XbrlDebtSummary): void 
   }
 }
 
-/** v2 결과 → 기존 compact 형식({current,nonCurrent,total} 튜플) + 확장 필드 */
-export function toCompactIbd(r: IbdV2Result) {
+/** [계정명, 금액, 범주] — 캐시·도구 상세 출력의 행 단위 */
+export type IbdTuple = [string, number, IbdOutCategory];
+
+/** 캐시에 저장하는 이자부부채(행 단위 전체). 도구는 여기서 요약·상세를 만든다(ibd-output.ts) */
+export interface CompactIbd {
+  total: number;
+  current: IbdTuple[];
+  nonCurrent: IbdTuple[];
+  /** 유동/비유동 구분이 없는 재무상태표의 항목 */
+  unclassified?: IbdTuple[];
+  /** 합계에서 뺀 부채성 항목(상환전환우선주부채·신종자본증권 등) */
+  debtLike?: [string, number][];
+  checks?: string[];
+  notes?: string[];
+}
+
+/** 계정명만으로 범주 추정 — 차감계정의 본계정이 없을 때, 범주 없는 옛 캐시(2-튜플) 변환에 쓴다 */
+export function guessCategoryByName(account: string): IbdOutCategory {
+  const n = normName(account);
+  if (/판매후리스|유동화/.test(n)) return "otherDebt";
+  if (NAME_LEASE.test(n)) return "lease";
+  if (/사채|전환권|신주인수권|교환권|기업어음|상환할증금/.test(n) && !/차입/.test(n)) return "bonds";
+  return "borrowings";
+}
+
+/** v2 결과 → 캐시 형식. 차감계정은 본계정 범주로 표시(계정명으로 차감계정임을 알 수 있다) */
+export function toCompactIbd(r: IbdV2Result): CompactIbd | null {
   if (r.excluded) return null;
-  const tup = (l: IbdLine[]) => l.map((x) => [x.account, x.amount] as [string, number]);
+  const tup = (l: IbdLine[]) =>
+    l.map((x) => [x.account, x.amount, x.category === "contra" ? (x.netOf ?? guessCategoryByName(x.account)) : x.category] as IbdTuple);
   return {
-    current: tup(r.current),
-    nonCurrent: tup([...r.nonCurrent, ...r.unclassified]),
     total: r.total,
+    current: tup(r.current),
+    nonCurrent: tup(r.nonCurrent),
+    ...(r.unclassified.length ? { unclassified: tup(r.unclassified) } : {}),
     ...(r.debtLike.length ? { debtLike: r.debtLike.map((d) => [d.account, d.amount] as [string, number]) } : {}),
     ...(r.checks.length ? { checks: r.checks } : {}),
     ...(r.notes.length ? { notes: r.notes } : {}),
+  };
+}
+
+/**
+ * 옛 캐시(v2.0·v2.1 — [계정명, 금액] 2-튜플, 미구분 항목이 nonCurrent 에 섞임)를 현재 형식으로.
+ * 범주는 계정명으로 추정한다. 이미 3-튜플이면 그대로 둔다.
+ */
+export function normalizeCompactIbd(ibd: unknown): CompactIbd | null {
+  if (!ibd || typeof ibd !== "object") return null;
+  const o = ibd as Record<string, unknown>;
+  const fix = (a: unknown): IbdTuple[] =>
+    Array.isArray(a)
+      ? a.map((t) => {
+          const [acc, amt, cat] = t as [string, number, IbdOutCategory | undefined];
+          return [acc, amt, cat ?? guessCategoryByName(acc)] as IbdTuple;
+        })
+      : [];
+  return {
+    ...(o as unknown as CompactIbd),
+    total: Number(o.total ?? 0),
+    current: fix(o.current),
+    nonCurrent: fix(o.nonCurrent),
+    ...(o.unclassified ? { unclassified: fix(o.unclassified) } : {}),
   };
 }
 

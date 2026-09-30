@@ -115,6 +115,7 @@ valuation_get_data(
 #### ⚠️ 파라미터 규칙
 - `stock_codes`: **최대 10개** 배열. 단일 종목은 문자열도 허용.
 - `valuation_date`: 분기말(`YYYY0331` / `YYYY0630` / `YYYY0930` / `YYYY1231`)이면 캐시로 즉시 응답. 그 외 날짜도 같은 규칙으로 실시간 계산(느림).
+- `ibd_detail`: 기본 `false` — 이자부부채는 총액과 구역·범주별 소계만. 계정 단위 근거가 필요하면(검토·조서) `true` 로 `ibd.lines` 까지 받는다.
 - `year`: 더 이상 쓰지 않습니다. 재무는 **평가기준일 당시 공시된 최신 정기보고서**로 자동 선택되고(예: 20250630 → 2025 1분기보고서), `financials.report` 에 표시됩니다.
 
 #### 반환 포맷 (compact JSON — 종목당)
@@ -127,11 +128,13 @@ valuation_get_data(
   "valuationDate": "20251231",
   "beta": { "weekly": { "2Y": [raw, adjusted, dataPoints] }, "monthly": { "5Y": [raw, adjusted, dataPoints] } },
   "ibd": {
-    "current":    [["단기차입금", 17574980000000], ["유동성장기부채", 1177508000000]],
-    "nonCurrent": [["사채", 7134000000], ["장기차입금", 6479517000000]],
     "total": 25239139000000,
+    "current":    [["차입금", 18752488000000]],
+    "nonCurrent": [["차입금", 6479517000000], ["사채", 7134000000]],
+    "byCategory": { "borrowings": 25232005000000, "bonds": 7134000000, "lease": 0, "otherDebt": 0 },
     "debtLike": [["상환전환우선주부채", 0]],
-    "checks": ["…산정 경고(있을 때만)…"]
+    "checks": ["…산정 경고(있을 때만)…"],
+    "lines": { "current": [["단기차입금", 17574980000000, "borrowings"], ["유동성장기부채", 1177508000000, "borrowings"]], "nonCurrent": ["…ibd_detail=true 일 때만…"] }
   },
   "ibdExcluded": "금융업일 때만 — 산정 제외 사유",
   "nci": 1234,
@@ -155,6 +158,7 @@ valuation_get_data(
 - 순차입금·EV = `derived.netDebt`, `derived.enterpriseValue`
 - 손익 멀티플은 `financials.incomeMonths` 가 12가 아니면 누적 기간이므로 연환산 여부를 명시할 것
 - `ibd.debtLike`(상환전환우선주부채 등) 포함 여부는 사용자 판단 — 기본 합계에는 빠져 있음
+- 리스부채를 빼고 보려면 `ibd.total − ibd.byCategory.lease` (IFRS 16 이전 기준과 비교할 때 등). 범주: borrowings 차입금, bonds 사채(차감계정 순액), lease 리스부채, otherDebt 유동화채무·판매후리스 등
 
 엑셀에서 사용 중이면 `response_format="table"` 같은 옵션이 없으므로 LLM이 직접 TSV/Markdown 표로 정리해 돌려주세요.
 

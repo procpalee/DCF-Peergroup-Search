@@ -20,7 +20,7 @@
 | `peergroup_get_population` | **결정론적 Peer 모집단** — (평가기준일, 업종코드) → 불변 분기말 스냅샷에서 동일 모집단 반환. 종목별 사업의 개요 + 부문별 매출(2-phase 페이지네이션) + 배제판단 플래그(스팩/지주사/리츠/12월외결산/관리종목) + `populationHash`. 라이브 폴백 없음 | `data/peer-snapshot/{YYYYMMDD}.json.gz` |
 | `search_by_industry` | KSIC 업종코드/키워드로 해당 업종 전 상장사 리스트 즉시 반환 (최신본, 시점 미고정 — 모집단 확정엔 위 도구 사용) | `data/company-industry.json` |
 | `get_business_content` | 사업보고서 "II. 사업의 내용 / 주요 제품 및 서비스" 원문 추출 (**2,611 / 2,617 종목, 99.8% 커버**) | `data/business-cache/{year}.json.gz` |
-| `valuation_get_data` | **가치평가 통합 패키지** — 베타(Weekly-2Y·Monthly-5Y) + 이자부부채(유동/비유동, 부채성 항목 분리) + 비지배지분 + 세전이익 + 시가총액 + 현금·자본·실적 + 순차입금·EV. 분기말은 캐시 히트 | `data/valuation-cache/{YYYYMMDD}.json` |
+| `valuation_get_data` | **가치평가 통합 패키지** — 베타(Weekly-2Y·Monthly-5Y) + 이자부부채(총액 + 구역·범주별 소계, `ibd_detail=true` 면 계정 행까지, 부채성 항목 분리) + 비지배지분 + 세전이익 + 시가총액 + 현금·자본·실적 + 순차입금·EV. 분기말은 캐시 히트 | `data/valuation-cache/{YYYYMMDD}.json` |
 
 ### 실시간 API 조회 (최신 데이터 확보)
 

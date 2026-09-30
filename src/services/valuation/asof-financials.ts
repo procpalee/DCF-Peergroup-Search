@@ -6,10 +6,14 @@
  *  2. 재무상태표 → 이자부부채 엔진 v2, 필요 시 XBRL 주석 보충
  *  3. 현금·자본·실적(fundamentals)
  *  4. 주식수 — 해당 보고서 → (3분기면) 같은 해 반기 → 직전 사업보고서
+ *
+ * 원자료 보관(RawStore, 선택): 보고서 단위로 재무 행·XBRL 주석 사실·주식수를 남겨 두면
+ * 엔진을 고친 뒤 다시 계산할 때 DART 를 다시 부르지 않는다(수집 스크립트·검증 코퍼스).
  */
 import { fetchFinancials, fetchStockQuantity, extractSharesInfo } from "../opendart/client";
-import { computeIbdV2, applyXbrlSupplement, toCompactIbd, IBD_ENGINE_VERSION } from "../opendart/ibd-engine";
-import { fetchXbrlXml, parseXbrlDebtFacts, summarizeXbrlDebt } from "../opendart/xbrl-debt-facts";
+import { computeIbdV2, applyXbrlSupplement, toCompactIbd, IBD_ENGINE_VERSION, type IbdV2Result } from "../opendart/ibd-engine";
+import { fetchXbrlXml, parseXbrlInstantFacts, summarizeXbrlDebt, type XbrlFacts, type XbrlScope } from "../opendart/xbrl-debt-facts";
+import type { DartFinancialItem } from "../opendart/types";
 import { fetchPeriodicReports, selectAsOfReport, monthsBeforeDate, type AsOfReport } from "../opendart/report-asof";
 import { extractFundamentals, type Fundamentals } from "../opendart/fundamentals";
 
@@ -36,6 +40,59 @@ export interface CompanyRef {
 /** 호출 한도 초과 같은 치명 오류 감지 — 수집 스크립트가 중단 판단에 쓴다 */
 export type FatalCheck = (e: unknown) => void;
 
+/** 보고서 한 건의 원자료 — 재계산·검증용 */
+export interface RawReport {
+  v: 1;
+  /** DART 가 돌려준 접수번호(정정본이면 선택 보고서와 다를 수 있음) */
+  rceptNoReturned: string;
+  bsnsYear: string;
+  fsDiv: "CFS" | "OFS";
+  /** 재무상태표·손익(BS·IS·CIS) 행 — 필요한 필드만 */
+  items: DartFinancialItem[];
+  /** 주석 XBRL 의 당기말 차원 없는 사실(차입·사채·리스·부채 계열). null = 받았지만 없음, 없으면 아직 안 받음 */
+  xbrl?: { scope: XbrlScope; facts: XbrlFacts } | null;
+  /** 주식수 조회 결과(체인 적용 후). 없으면 아직 안 받음 */
+  shares?: { outstanding: number | null; source?: string };
+}
+
+export interface RawStore {
+  get(rceptNo: string): RawReport | null;
+  put(rceptNo: string, raw: RawReport): void;
+}
+
+const KEEP_SJ = new Set(["BS", "IS", "CIS"]);
+function trimItems(items: DartFinancialItem[]): DartFinancialItem[] {
+  return items
+    .filter((i) => KEEP_SJ.has(i.sj_div))
+    .map((i) => ({
+      rcept_no: i.rcept_no,
+      bsns_year: i.bsns_year,
+      reprt_code: i.reprt_code,
+      account_id: i.account_id,
+      account_nm: i.account_nm,
+      fs_div: i.fs_div,
+      fs_nm: i.fs_nm,
+      sj_div: i.sj_div,
+      sj_nm: i.sj_nm,
+      thstrm_nm: i.thstrm_nm,
+      thstrm_dt: i.thstrm_dt,
+      thstrm_amount: i.thstrm_amount,
+      ...(i.thstrm_add_amount != null ? { thstrm_add_amount: i.thstrm_add_amount } : {}),
+      frmtrm_nm: i.frmtrm_nm,
+      frmtrm_amount: i.frmtrm_amount,
+      ord: i.ord,
+    }));
+}
+
+/** 주석 XBRL 사실을 원자료에 채운다(없을 때만 DART 호출). 검증 코퍼스는 모든 회사에 대해 부른다 */
+export async function ensureXbrlFacts(raw: RawReport, reprtCode: string, apiKey?: string): Promise<RawReport["xbrl"]> {
+  if (raw.xbrl !== undefined) return raw.xbrl;
+  const xml = await fetchXbrlXml(raw.rceptNoReturned, reprtCode, apiKey);
+  const scope: XbrlScope = raw.fsDiv === "OFS" ? "SeparateMember" : "ConsolidatedMember";
+  raw.xbrl = xml ? { scope, facts: parseXbrlInstantFacts(xml, raw.bsnsYear, scope) } : null;
+  return raw.xbrl;
+}
+
 export function emptyFin(rep: AsOfReport, error?: string): FinResult {
   return {
     report: { ...rep, fsDiv: null, bsnsYear: null, rceptNoReturned: null },
@@ -49,38 +106,64 @@ export function emptyFin(rep: AsOfReport, error?: string): FinResult {
   };
 }
 
+/**
+ * 원자료로 이자부부채 산정(순수 — 네트워크 없음). 수집·실시간 도구·검증 스크립트가 같은 경로를 쓴다.
+ * 본문이 '금융부채'로 묶였고 원자료에 주석 XBRL 사실이 있으면 보충한다.
+ */
+export function computeIbdFromRaw(raw: RawReport, industryCode?: string | null): IbdV2Result {
+  const r = computeIbdV2(raw.items, { industryCode });
+  const agg = r.meta.aggregatedFinancialLiabilities;
+  if (!r.excluded && (agg.current || agg.nonCurrent) && raw.xbrl) applyXbrlSupplement(r, summarizeXbrlDebt(raw.xbrl.facts));
+  return r;
+}
+
 export async function fetchFinForReport(
   c: CompanyRef,
   rep: AsOfReport,
   apiKey?: string,
   onError: FatalCheck = () => {},
+  store?: RawStore,
 ): Promise<FinResult> {
   const base = emptyFin(rep);
-  // 사업연도 후보를 시도해 응답 접수번호가 선택 보고서와 같은 것을 채택(정정본이면 다를 수 있음)
-  let items: Awaited<ReturnType<typeof fetchFinancials>> = [];
-  for (const y of rep.yearCandidates) {
-    const got = await fetchFinancials(c.corpCode, y, rep.reprtCode, "CFS", apiKey);
-    if (got.length === 0) continue;
-    if (items.length === 0 || got[0].rcept_no === rep.rceptNo) {
-      items = got;
-      base.report.bsnsYear = y;
+  let raw = store?.get(rep.rceptNo) ?? null;
+  let dirty = false;
+  if (!raw) {
+    // 사업연도 후보를 시도해 응답 접수번호가 선택 보고서와 같은 것을 채택(정정본이면 다를 수 있음)
+    let items: DartFinancialItem[] = [];
+    let year = "";
+    for (const y of rep.yearCandidates) {
+      const got = await fetchFinancials(c.corpCode, y, rep.reprtCode, "CFS", apiKey);
+      if (got.length === 0) continue;
+      if (items.length === 0 || got[0].rcept_no === rep.rceptNo) {
+        items = got;
+        year = y;
+      }
+      if (got[0].rcept_no === rep.rceptNo) break;
     }
-    if (got[0].rcept_no === rep.rceptNo) break;
+    if (items.length === 0) return { ...base, error: "재무제표 없음" };
+    raw = {
+      v: 1,
+      rceptNoReturned: items[0].rcept_no,
+      bsnsYear: year,
+      // fetchFinancials 는 연결이 없으면 별도로 폴백하며, 실제 조회 구분을 fs_div 에 붙여 준다
+      fsDiv: items[0].fs_div === "OFS" ? "OFS" : "CFS",
+      items: trimItems(items),
+    };
+    dirty = true;
   }
-  if (items.length === 0) return { ...base, error: "재무제표 없음" };
-  base.report.rceptNoReturned = items[0].rcept_no;
-  // fetchFinancials 는 연결이 없으면 별도로 폴백하며, 실제 조회 구분을 fs_div 에 붙여 준다
-  base.report.fsDiv = items[0].fs_div === "OFS" ? "OFS" : "CFS";
+  const items = raw.items;
+  base.report.bsnsYear = raw.bsnsYear;
+  base.report.rceptNoReturned = raw.rceptNoReturned;
+  base.report.fsDiv = raw.fsDiv;
 
-  const r = computeIbdV2(items, { industryCode: c.industryCode });
-  const agg = r.meta.aggregatedFinancialLiabilities;
-  if (!r.excluded && (agg.current || agg.nonCurrent)) {
-    const xml = await fetchXbrlXml(items[0].rcept_no, rep.reprtCode, apiKey);
-    if (xml) {
-      const scope = base.report.fsDiv === "OFS" ? "SeparateMember" : "ConsolidatedMember";
-      applyXbrlSupplement(r, summarizeXbrlDebt(parseXbrlDebtFacts(xml, base.report.bsnsYear, scope)));
-    }
+  // 본문이 '금융부채'로 묶였으면 주석 XBRL 이 필요 — 원자료에 없을 때만 받는다
+  const probe = computeIbdV2(items, { industryCode: c.industryCode });
+  const agg = probe.meta.aggregatedFinancialLiabilities;
+  if (!probe.excluded && (agg.current || agg.nonCurrent) && raw.xbrl === undefined) {
+    await ensureXbrlFacts(raw, rep.reprtCode, apiKey);
+    dirty = true;
   }
+  const r = computeIbdFromRaw(raw, c.industryCode);
   base.ibd = toCompactIbd(r);
   base.ibdExcluded = r.excluded;
   base.xbrlSupplemented = r.meta.xbrlSupplemented;
@@ -89,23 +172,40 @@ export async function fetchFinForReport(
   base.fundamentals = extractFundamentals(items, monthsInto);
 
   // 주식수 — 분기보고서는 주식총수를 '-'로 두는 회사가 많다(삼성전자 2025.3Q 등).
-  const y = Number(base.report.bsnsYear);
-  const chain: [string, string, string | undefined][] = [[String(y), rep.reprtCode, undefined]];
-  if (rep.reprtCode === "11014") chain.push([String(y), "11012", `${y} 반기보고서`]);
-  if (rep.reprtCode !== "11011") chain.push([String(y - 1), "11011", `${y - 1} 사업보고서`]);
-  for (const [yr, rc, label] of chain) {
-    try {
-      const qty = await fetchStockQuantity(c.corpCode, yr, rc, apiKey);
-      const n = extractSharesInfo(qty, yr, rc)?.outstanding ?? null;
-      if (n && n > 0) {
-        base.sharesDart = n;
-        if (label) base.sharesSource = label;
-        break;
+  if (!raw.shares) {
+    const y = Number(base.report.bsnsYear);
+    const chain: [string, string, string | undefined][] = [[String(y), rep.reprtCode, undefined]];
+    if (rep.reprtCode === "11014") chain.push([String(y), "11012", `${y} 반기보고서`]);
+    if (rep.reprtCode !== "11011") chain.push([String(y - 1), "11011", `${y - 1} 사업보고서`]);
+    let got: RawReport["shares"] = { outstanding: null };
+    let failed = false;
+    for (const [yr, rc, label] of chain) {
+      try {
+        const qty = await fetchStockQuantity(c.corpCode, yr, rc, apiKey);
+        const n = extractSharesInfo(qty, yr, rc)?.outstanding ?? null;
+        if (n && n > 0) {
+          got = { outstanding: n, ...(label ? { source: label } : {}) };
+          break;
+        }
+      } catch (e) {
+        onError(e);
+        failed = true;
       }
-    } catch (e) {
-      onError(e);
     }
+    // 호출 오류로 못 받은 경우는 남기지 않는다(다음 실행에서 다시 시도)
+    if (!failed || got.outstanding) {
+      raw.shares = got;
+      dirty = true;
+    }
+    if (got.outstanding) {
+      base.sharesDart = got.outstanding;
+      if (got.source) base.sharesSource = got.source;
+    }
+  } else if (raw.shares.outstanding) {
+    base.sharesDart = raw.shares.outstanding;
+    if (raw.shares.source) base.sharesSource = raw.shares.source;
   }
+  if (store && dirty) store.put(rep.rceptNo, raw);
   return base;
 }
 

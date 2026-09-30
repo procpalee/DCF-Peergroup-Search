@@ -6,6 +6,7 @@
  *   npx tsx scripts/collect-valuation-cache.ts --latest             # 아직 없는 최근 분기말 1개
  *   npx tsx scripts/collect-valuation-cache.ts 20251231 --financials-only   # 재무만 재산정(주가·베타 진행파일 재사용)
  *   npx tsx scripts/collect-valuation-cache.ts 20260331 --codes 005930,000660 --out /tmp/kvd   # 시범(일부 종목, 별도 폴더)
+ *   npx tsx scripts/collect-valuation-cache.ts 20260630 --financials-only --recompute-all   # 엔진 판이 바뀐 보고서를 전부 재계산
  *
  * 재무 시점: 기준일 "당시" 공시된 최신 정기보고서(사업·반기·분기) — report-asof.ts.
  * 이자부부채: 재무상태표 본문 기준 엔진 v2(ibd-engine.ts) + 필요 시 XBRL 주석 보충.
@@ -14,6 +15,7 @@
  * 단계(모두 이어받기 가능 — 중단 후 재실행하면 이어서 진행):
  *   1. 공시 목록 (회사당 1회, _shared/report-lists.json)
  *   2. 재무 (보고서 접수번호 단위로 결과 저장 → 여러 기준일이 같은 보고서를 쓰면 재사용, _shared/fin-v2.json)
+ *      원자료(재무 행·XBRL 주석 사실·주식수)는 _shared/raw/ 에 보고서별로 보관 — 엔진 판이 바뀌면 DART 호출 없이 재계산.
  *   3. 참조 상장주식수 (네이버, 실행당 1회)
  *   4. 종가·베타 (기준일별, _progress/price-*.json · beta-*.json)
  *   5. 조립 → data/valuation-cache/{기준일}.json + {기준일}.meta.json
@@ -23,9 +25,10 @@ import path from "path";
 import { fetchHistoricalPrices, fetchMarketData } from "../src/services/naver/client";
 import { computeBetaGridBatch } from "../src/services/beta-calc";
 import { getIndustryName } from "../src/services/opendart/ksic-codes";
-import { sanitizeShares, migrateIbdMessages, IBD_ENGINE_VERSION } from "../src/services/opendart/ibd-engine";
+import { sanitizeShares, migrateIbdMessages, normalizeCompactIbd, IBD_ENGINE_VERSION } from "../src/services/opendart/ibd-engine";
 import { fetchPeriodicReports, selectAsOfReport, monthsBeforeDate, type AsOfReport } from "../src/services/opendart/report-asof";
 import { fetchFinForReport, emptyFin, type FinResult } from "../src/services/valuation/asof-financials";
+import { createFsRawStore } from "../src/services/valuation/raw-store-fs";
 import type { DartListDoc } from "../src/services/opendart/document-parser";
 
 // ─── 설정 ───
@@ -119,7 +122,13 @@ function parseArgs() {
   const ci = args.indexOf("--codes");
   const codes = ci >= 0 ? new Set(args[ci + 1].split(",")) : null;
   const outDir = args.includes("--out") ? args[args.indexOf("--out") + 1] : null;
-  return { dates: [...new Set(dates)].sort(), financialsOnly: args.includes("--financials-only"), codes, outDir };
+  return {
+    dates: [...new Set(dates)].sort(),
+    financialsOnly: args.includes("--financials-only"),
+    codes,
+    outDir,
+    recomputeAll: args.includes("--recompute-all"),
+  };
 }
 
 function getStocks(asOf: string): Stock[] {
@@ -190,9 +199,18 @@ async function ensureReportLists(stocks: Stock[], through: string): Promise<Reco
 
 // ─── 2. 재무 ───
 
-/** 이전 엔진 판 결과 중 주석 보충 경로를 탄 보고서만 다시 계산(나머지는 결과 동일 — 메시지만 이관) */
-function needsRecompute(f: FinResult): boolean {
+const rawStore = createFsRawStore();
+const RECOMPUTE_ALL = process.argv.includes("--recompute-all");
+
+/**
+ * 이전 엔진 판 결과를 다시 계산할지.
+ *  - 원자료가 있으면 항상(DART 호출 없음)
+ *  - --recompute-all 이면 원자료가 없어도(DART 로 다시 받음)
+ *  - 그 밖에는 주석 보충 경로를 탄 보고서만(v2.0→v2.1 이관 규칙 — 나머지는 결과 동일)
+ */
+function needsRecompute(f: FinResult, rceptNo: string): boolean {
   if (f.engine === ENGINE_VERSION) return false;
+  if (RECOMPUTE_ALL || rawStore.has(rceptNo)) return true;
   const msgs = [...(f.ibd?.checks ?? []), ...(f.ibd?.notes ?? [])];
   return msgs.some((m) => m.includes("주석"));
 }
@@ -204,16 +222,17 @@ async function collectFinancials(stocks: Stock[], asOf: string, lists: Record<st
   for (const s of stocks) {
     const rep = selectAsOfReport(lists[s.corpCode]?.docs ?? [], asOf, s.accMonth);
     pick[s.code] = rep?.rceptNo ?? null;
-    if (rep && (!fin[rep.rceptNo] || needsRecompute(fin[rep.rceptNo]))) todo.push({ s, rep });
+    if (rep && (!fin[rep.rceptNo] || needsRecompute(fin[rep.rceptNo], rep.rceptNo))) todo.push({ s, rep });
   }
   console.log(`[재무 ${asOf}] 보고서 선택 ${Object.values(pick).filter(Boolean).length}/${stocks.length}, 신규 수집 ${todo.length}`);
   let done = 0;
   for (let i = 0; i < todo.length; i += DART_BATCH_SIZE) {
     const batch = todo.slice(i, i + DART_BATCH_SIZE);
+    const offline = batch.every(({ rep }) => rawStore.has(rep.rceptNo));
     await Promise.all(
       batch.map(async ({ s, rep }) => {
         try {
-          fin[rep.rceptNo] = await fetchFinForReport(s, rep, apiKey, checkFatal);
+          fin[rep.rceptNo] = await fetchFinForReport(s, rep, apiKey, checkFatal, rawStore);
         } catch (e) {
           checkFatal(e);
           fin[rep.rceptNo] = emptyFin(rep, (e as Error).message);
@@ -225,7 +244,8 @@ async function collectFinancials(stocks: Stock[], asOf: string, lists: Record<st
       saveJson(FIN_PATH, fin);
       console.log(`[재무 ${asOf}] ${done}/${todo.length}`);
     }
-    await sleep(DART_DELAY_MS);
+    // 원자료로만 재계산한 묶음은 DART 를 부르지 않았으니 쉬지 않는다
+    if (!offline) await sleep(DART_DELAY_MS);
   }
   saveJson(FIN_PATH, fin);
   return { fin, pick };
@@ -347,7 +367,8 @@ function assemble(
       year: f?.report.bsnsYear ?? null,
       valuationDate: asOf,
       beta: betas[s.code] ?? { weekly: null, monthly: null },
-      ibd: migrateIbdMessages(f?.ibd ?? null),
+      // 옛 판 결과(2-튜플)도 현재 형식([계정명, 금액, 범주])으로 맞춰 쓴다
+      ibd: normalizeCompactIbd(migrateIbdMessages(f?.ibd ?? null)),
       ...(f?.ibdExcluded ? { ibdExcluded: f.ibdExcluded } : {}),
       nci: fu?.nci ?? null,
       pretaxIncome: fu?.pretaxIncome ?? null,

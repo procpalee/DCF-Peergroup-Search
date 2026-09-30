@@ -52,19 +52,36 @@ const WANTED = new Set([
  * year 는 참고용(여러 개가 걸리면 그 연도를 우선).
  */
 export function parseXbrlDebtFacts(xml: string, year: string | null, scope: XbrlScope): XbrlFacts {
+  return parseXbrlInstantFacts(xml, year, scope, (el, prefix) => prefix === "ifrs-full" && WANTED.has(el));
+}
+
+/** 원자료 보관·검증용으로 남길 요소 — 차입·사채·리스·부채 계열 */
+export const DEBTISH_ELEMENT = /Borrow|Loan|Bond|Lease|Debenture|CommercialPaper|Overdraft|Liabilit|Debt|Securitiz|Preference/i;
+
+/**
+ * scope(연결/별도)의 당기말 "차원 없는" 사실을 모은다(요소 필터 선택).
+ * 키: ifrs-full 요소는 접두 없이(예: Borrowings), 그 밖(dart·entity 확장)은 "접두:요소".
+ * 같은 요소가 같은 문맥에 여러 번 태깅되면(주석 표마다 부분합 — LG디스플레이 2025 LoansReceived 8.31조·12.14조)
+ * 큰 값(총액)을 쓴다.
+ */
+export function parseXbrlInstantFacts(
+  xml: string,
+  year: string | null,
+  scope: XbrlScope,
+  keep: (element: string, prefix: string) => boolean = (el) => DEBTISH_ELEMENT.test(el),
+): XbrlFacts {
   const suffix = `_ifrs-full_ConsolidatedAndSeparateFinancialStatementsAxis_ifrs-full_${scope}`;
   const ctxRe = new RegExp(`context id="(CFY(\\d{4})e[A-Za-z0-9]*${suffix})"`, "g");
   const candidates = [...xml.matchAll(ctxRe)].map((m) => ({ id: m[1], y: m[2] }));
   const chosen = candidates.find((c) => c.y === year) ?? candidates[0];
   if (!chosen) return {};
   const facts: XbrlFacts = {};
-  const re = /<ifrs-full:([A-Za-z]+) [^>]*contextRef="([^"]+)"[^>]*>(-?\d+)</g;
+  const re = /<([A-Za-z][\w-]*):([A-Za-z]\w*) [^>]*contextRef="([^"]+)"[^>]*>(-?\d+)</g;
   for (const m of xml.matchAll(re)) {
-    const [, el, ctx, v] = m;
-    if (ctx !== chosen.id || !WANTED.has(el)) continue;
-    // 같은 요소가 같은 문맥에 여러 번 태깅되면(주석 표마다 부분합 — LG디스플레이 2025 LoansReceived 8.31조·12.14조)
-    // 큰 값(총액)을 쓴다
-    facts[el] = Math.max(facts[el] ?? -Infinity, Number(v));
+    const [, prefix, el, ctx, v] = m;
+    if (ctx !== chosen.id || !keep(el, prefix)) continue;
+    const key = prefix === "ifrs-full" ? el : `${prefix}:${el}`;
+    facts[key] = Math.max(facts[key] ?? -Infinity, Number(v));
   }
   return facts;
 }
