@@ -232,7 +232,8 @@ async function collectFinancials(stocks: Stock[], asOf: string, lists: Record<st
     await Promise.all(
       batch.map(async ({ s, rep }) => {
         try {
-          fin[rep.rceptNo] = await fetchFinForReport(s, rep, apiKey, checkFatal, rawStore);
+          // 재계산이면 이전 결과의 주식수를 넘겨 주식수 조회를 아낀다
+          fin[rep.rceptNo] = await fetchFinForReport(s, rep, apiKey, checkFatal, rawStore, fin[rep.rceptNo]);
         } catch (e) {
           checkFatal(e);
           fin[rep.rceptNo] = emptyFin(rep, (e as Error).message);

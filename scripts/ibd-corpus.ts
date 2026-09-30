@@ -28,6 +28,8 @@ const apiKey = process.env.OPENDART_API_KEY ?? "";
 
 const ROOT = path.resolve(__dirname, "..");
 const LISTS = path.join(ROOT, "data/valuation-cache/_shared/report-lists.json");
+/** 수집 스크립트의 보고서별 결과 — 주식수를 재사용해 DART 호출을 아낀다 */
+const FIN = path.join(ROOT, "data/valuation-cache/_shared/fin-v2.json");
 const INDUSTRY = path.join(ROOT, "data/company-industry.json");
 const OUT_DIR = path.join(ROOT, "scripts/_scratch/ibd-corpus");
 const BATCH = 3;
@@ -59,6 +61,9 @@ async function main() {
   const industry: Record<string, { name: string; corpCode: string; industryCode: string; accMonth?: string; listedDate?: string }> =
     JSON.parse(fs.readFileSync(INDUSTRY, "utf8"));
   const store = createFsRawStore();
+  const prevFin: Record<string, { sharesDart: number | null; sharesSource?: string }> = fs.existsSync(FIN)
+    ? JSON.parse(fs.readFileSync(FIN, "utf8"))
+    : {};
 
   const entries: CorpusEntry[] = [];
   for (const [code, e] of Object.entries(industry)) {
@@ -98,7 +103,7 @@ async function main() {
           network = true;
           const rep = selectAsOfReport(lists[en.corpCode]?.docs ?? [], asOf, en.accMonth)!;
           try {
-            await fetchFinForReport(en, rep, apiKey, checkFatal, store);
+            await fetchFinForReport(en, rep, apiKey, checkFatal, store, prevFin[en.rceptNo]);
             const raw = store.get(en.rceptNo);
             if (raw && withXbrl && raw.xbrl === undefined) {
               await ensureXbrlFacts(raw, en.reprtCode, apiKey);

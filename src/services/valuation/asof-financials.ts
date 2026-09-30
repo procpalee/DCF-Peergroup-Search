@@ -123,6 +123,8 @@ export async function fetchFinForReport(
   apiKey?: string,
   onError: FatalCheck = () => {},
   store?: RawStore,
+  /** 이전 계산 결과의 주식수 — 원자료에 주식수가 없을 때 DART 를 다시 부르지 않고 쓴다(값이 있을 때만) */
+  knownShares?: { sharesDart: number | null; sharesSource?: string },
 ): Promise<FinResult> {
   const base = emptyFin(rep);
   let raw = store?.get(rep.rceptNo) ?? null;
@@ -172,6 +174,10 @@ export async function fetchFinForReport(
   base.fundamentals = extractFundamentals(items, monthsInto);
 
   // 주식수 — 분기보고서는 주식총수를 '-'로 두는 회사가 많다(삼성전자 2025.3Q 등).
+  if (!raw.shares && knownShares?.sharesDart) {
+    raw.shares = { outstanding: knownShares.sharesDart, ...(knownShares.sharesSource ? { source: knownShares.sharesSource } : {}) };
+    dirty = true;
+  }
   if (!raw.shares) {
     const y = Number(base.report.bsnsYear);
     const chain: [string, string, string | undefined][] = [[String(y), rep.reprtCode, undefined]];
