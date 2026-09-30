@@ -25,7 +25,10 @@ import path from "path";
 import { fetchHistoricalPrices, fetchMarketData } from "../src/services/naver/client";
 import { computeBetaGridBatch } from "../src/services/beta-calc";
 import { getIndustryName } from "../src/services/opendart/ksic-codes";
-import { sanitizeShares, migrateIbdMessages, normalizeCompactIbd, IBD_ENGINE_VERSION } from "../src/services/opendart/ibd-engine";
+import {
+  sanitizeShares, migrateIbdMessages, normalizeCompactIbd, IBD_ENGINE_VERSION, XBRL_ERROR_MSG, EXCEEDS_TL_MSG,
+  type CompactIbd, type IbdTuple,
+} from "../src/services/opendart/ibd-engine";
 import { fetchPeriodicReports, selectAsOfReport, monthsBeforeDate, type AsOfReport } from "../src/services/opendart/report-asof";
 import { fetchFinForReport, emptyFin, type FinResult } from "../src/services/valuation/asof-financials";
 import { createFsRawStore } from "../src/services/valuation/raw-store-fs";
@@ -115,8 +118,10 @@ function parseArgs() {
   const args = process.argv.slice(2);
   const dates = args.filter((a) => /^\d{8}$/.test(a));
   if (args.includes("--latest")) {
-    const missing = recentQuarterEnds(4).find((d) => !fs.existsSync(path.join(BASE_DIR, `${d}.json`)) ||
-      loadJson<{ engine?: string }>(path.join(BASE_DIR, `${d}.meta.json`))?.engine !== ENGINE_VERSION);
+    const missing = recentQuarterEnds(4).find((d) => {
+      const m = loadJson<{ engine?: string; stats?: { xbrlError?: number } }>(path.join(BASE_DIR, `${d}.meta.json`));
+      return !fs.existsSync(path.join(BASE_DIR, `${d}.json`)) || m?.engine !== ENGINE_VERSION || (m.stats?.xbrlError ?? 0) > 0;
+    });
     if (missing) dates.push(missing);
   }
   const ci = args.indexOf("--codes");
@@ -202,17 +207,22 @@ async function ensureReportLists(stocks: Stock[], through: string): Promise<Reco
 const rawStore = createFsRawStore();
 const RECOMPUTE_ALL = process.argv.includes("--recompute-all");
 
+/** 주석 XBRL 통신 오류로 끝난 결과 — 최대 3회까지 다시 계산(영구 오류가 같은 기준일을 매일 고르지 않게) */
+const XBRL_RETRY_MAX = 3;
+const isXbrlRetry = (f: FinResult) =>
+  (f.xbrlStatus === "xml_error" || !!f.ibd?.checks?.some((c) => c.startsWith(XBRL_ERROR_MSG.slice(0, 12)))) &&
+  (f.xbrlRetries ?? 0) < XBRL_RETRY_MAX;
+
 /**
- * 이전 엔진 판 결과를 다시 계산할지.
- *  - 원자료가 있으면 항상(DART 호출 없음)
- *  - --recompute-all 이면 원자료가 없어도(DART 로 다시 받음)
- *  - 그 밖에는 주석 보충 경로를 탄 보고서만(v2.0→v2.1 이관 규칙 — 나머지는 결과 동일)
+ * 결과를 다시 계산할지.
+ *  - --recompute-all 이면 항상
+ *  - XBRL 통신 오류로 끝난 결과는 재시도(상한 3회)
+ *  - 엔진 판이 다르면 항상(원자료가 있으면 DART 호출 없음, 없으면 다시 받음 — 한도는 이어받기)
  */
-function needsRecompute(f: FinResult, rceptNo: string): boolean {
-  if (f.engine === ENGINE_VERSION) return false;
-  if (RECOMPUTE_ALL || rawStore.has(rceptNo)) return true;
-  const msgs = [...(f.ibd?.checks ?? []), ...(f.ibd?.notes ?? [])];
-  return msgs.some((m) => m.includes("주석"));
+function needsRecompute(f: FinResult, _rceptNo: string): boolean {
+  if (RECOMPUTE_ALL) return true;
+  if (isXbrlRetry(f)) return true;
+  return f.engine !== ENGINE_VERSION;
 }
 
 async function collectFinancials(stocks: Stock[], asOf: string, lists: Record<string, ListsEntry>) {
@@ -228,12 +238,16 @@ async function collectFinancials(stocks: Stock[], asOf: string, lists: Record<st
   let done = 0;
   for (let i = 0; i < todo.length; i += DART_BATCH_SIZE) {
     const batch = todo.slice(i, i + DART_BATCH_SIZE);
-    const offline = batch.every(({ rep }) => rawStore.has(rep.rceptNo));
+    // XBRL 재시도는 원자료가 있어도 DART 를 부른다 — 호출 간격 유지
+    const offline = batch.every(({ rep }) => rawStore.has(rep.rceptNo) && !(fin[rep.rceptNo] && isXbrlRetry(fin[rep.rceptNo])));
     await Promise.all(
       batch.map(async ({ s, rep }) => {
         try {
           // 재계산이면 이전 결과의 주식수를 넘겨 주식수 조회를 아낀다
-          fin[rep.rceptNo] = await fetchFinForReport(s, rep, apiKey, checkFatal, rawStore, fin[rep.rceptNo]);
+          const prev = fin[rep.rceptNo];
+          const res = await fetchFinForReport(s, rep, apiKey, checkFatal, rawStore, prev);
+          if (res.xbrlStatus === "xml_error") res.xbrlRetries = (prev?.xbrlStatus === "xml_error" ? prev.xbrlRetries ?? 1 : 0) + 1;
+          fin[rep.rceptNo] = res;
         } catch (e) {
           checkFatal(e);
           fin[rep.rceptNo] = emptyFin(rep, (e as Error).message);
@@ -328,6 +342,88 @@ async function collectBetas(stocks: Stock[], asOf: string): Promise<Record<strin
 
 // ─── 5. 조립 ───
 
+const eokC = (n: number) => `${(n / 1e8).toLocaleString("ko-KR", { maximumFractionDigits: 1 })}억`;
+const DEBT_OUT = new Set(["borrowings", "bonds", "convertible", "borrowingsAndBonds", "otherDebt"]);
+/**
+ * 직전 정기보고서(기간이 다른 것) 대비 차입·리스 소실 경고 — 엔진은 보고서 한 건의 순수 함수라 기간 비교는 여기서.
+ *  - 이번에 주석 차입을 못 넣었고 묶인 구역에 본문 차입도 없는데, 직전에는 그 구역에 차입이 있었으면 check + partial
+ *  - 직전에 리스가 있었는데 이번에 리스 행이 전혀 없으면 check(기타금융부채에 묶였을 가능성)
+ * 기준 금액 = max(50억, 지배기업 소유주지분의 5%). 필드가 없는 옛 결과는 판단하지 않는다.
+ */
+function historyChecks(f: FinResult, docs: DartListDoc[], fin: Record<string, FinResult>): { checks: string[]; partial: boolean } {
+  const out = { checks: [] as string[], partial: false };
+  if (!f.ibd) return out;
+  const pd = docs
+    .filter((d) => d.rcept_dt < f.report.rceptDate && fin[d.rcept_no]?.ibd && fin[d.rcept_no].report.period !== f.report.period)
+    .sort((a, b) => b.rcept_dt.localeCompare(a.rcept_dt))[0];
+  if (!pd) return out;
+  const pi = normalizeCompactIbd(fin[pd.rcept_no].ibd)!;
+  const ci = normalizeCompactIbd(f.ibd)!;
+  const eq = Math.max(f.fundamentals?.equityParent ?? f.fundamentals?.equityTotal ?? 0, 0);
+  const thr = Math.max(5e9, 0.05 * eq);
+  const debt = (t: IbdTuple[]) => t.filter((x) => DEBT_OUT.has(x[2])).reduce((a, x) => a + x[1], 0);
+  const prevBad = (pi.checks ?? []).some((c) => /보충액이 본문 금융부채를 초과|부채총계를 초과/.test(c));
+  if (f.aggregatedSections && f.xbrlApplied && !f.xbrlApplied.debt && !prevBad)
+    for (const s of f.aggregatedSections) {
+      const prevDebt = debt(pi[s]);
+      const curBody = debt(ci[s].filter((x) => !x[0].includes("(주석")));
+      // 직전 값이 자본보다 크면(과대 보충 등 이상치 가능) 판단하지 않는다
+      if (curBody === 0 && prevDebt >= thr && prevDebt <= eq) {
+        out.checks.push(`직전 보고서(${pd.rcept_no}) ${s === "current" ? "유동" : "비유동"} 차입 ${eokC(prevDebt)} — 이번 보충 실패`);
+        out.partial = true;
+      }
+    }
+  const lease = (c: CompactIbd) => [...c.current, ...c.nonCurrent, ...(c.unclassified ?? [])].filter((x) => x[2] === "lease").reduce((a, x) => a + x[1], 0);
+  if (lease(pi) >= thr && lease(ci) === 0) out.checks.push(`리스 행 소멸(직전 ${eokC(lease(pi))}) — 기타금융부채 묶임 여부 확인`);
+  return out;
+}
+
+/**
+ * 데이터 품질 보류(단위 이상) — 같은 회사 직전 보고서 대비 자본이 100배 이상 튀고 이자부부채도 같은 배율로 튀면
+ * DART 원자료 단위 오류로 보고 재무 레코드 전체를 보류한다(현금만 남으면 순차입금이 망가진다). 절대값 500조 초과도 보류.
+ */
+const eqOf = (x?: FinResult) => x?.fundamentals?.equityTotal ?? null;
+/** 비재귀 이상치 판정 — 500조 초과, 또는 그 앞 보고서 대비 자본 100배 */
+function looksOutlier(x: FinResult, before?: FinResult): boolean {
+  if ((x.ibd?.total ?? 0) > 5e14) return true;
+  const a = eqOf(x);
+  const b = eqOf(before);
+  if (!a || !b || a <= 0 || b <= 0) return false;
+  return a / b >= 100 || a / b <= 0.01;
+}
+
+function qualityHold(f: FinResult, docs: DartListDoc[], fin: Record<string, FinResult>): string | null {
+  // IBD 는 부채의 부분집합 — 넘으면 단위·태깅 오류 또는 이중 계상 → 레코드 전체 보류
+  if (f.ibd?.completenessReason?.includes("부채총계 초과") || f.ibd?.checks?.some((c) => c.startsWith(EXCEEDS_TL_MSG)))
+    return "이자부부채가 부채총계를 초과 — 원자료 또는 엔진 판정 확인";
+  const total = f.ibd?.total ?? 0;
+  if (total > 5e14) return `이자부부채 ${Math.round(total / 1e12)}조 — 단위 오류 의심`;
+  const eq = f.fundamentals?.equityTotal;
+  if (!eq || eq <= 0) return null;
+  const prevs = docs
+    .filter((d) => d.rcept_dt < f.report.rceptDate && eqOf(fin[d.rcept_no]) != null)
+    .sort((a, b) => b.rcept_dt.localeCompare(a.rcept_dt));
+  // 직전 보고서가 그 자체로 이상치면 한 단계 앞과 비교(정상 → 이상치 → 정상에서 세 번째를 보류하지 않게)
+  const prev = prevs[0] && looksOutlier(fin[prevs[0].rcept_no], prevs[1] && fin[prevs[1].rcept_no]) ? prevs[1] : prevs[0];
+  if (!prev) return null;
+  const p = fin[prev.rcept_no];
+  const pe = eqOf(p)!;
+  if (pe <= 0) return null; // 직전이 자본잠식이면 배율 비교 불가
+  const r = eq / pe;
+  if (r < 100 && r > 0.01) return null;
+  const pt = p.ibd?.total ?? 0;
+  if (pt > 0 && total > 0) {
+    const ri = total / pt;
+    if (ri < r * 0.5 || ri > r * 2) return null;
+  } else {
+    // IBD 배율을 볼 수 없으면(무차입) 현금 배율로 확인 — 자본만 튀면 보류하지 않음
+    const c = f.fundamentals?.cash ?? 0;
+    const pc = p.fundamentals?.cash ?? 0;
+    if (!(c > 0 && pc > 0 && c / pc >= r * 0.5 && c / pc <= r * 2)) return null;
+  }
+  return `자본이 직전 보고서(${prev.rcept_no}) 대비 ${r >= 100 ? Math.round(r) + "배" : (1 / r).toFixed(0) + "분의 1"} — 단위 오류 의심`;
+}
+
 function assemble(
   stocks: Stock[],
   asOf: string,
@@ -336,11 +432,24 @@ function assemble(
   listed: Record<string, number | null>,
   prices: Record<string, number | null>,
   betas: Record<string, { weekly: BetaGrid; monthly: BetaGrid }>,
+  lists: Record<string, ListsEntry>,
 ) {
   const out: Record<string, unknown> = {};
-  const stats = { total: 0, noReport: 0, ibdNull: 0, ibdExcluded: 0, xbrlSupplemented: 0, ibdChecks: 0, sharesFixed: 0, sharesNull: 0, priceNull: 0 };
+  const stats = {
+    total: 0, noReport: 0, ibdNull: 0, ibdExcluded: 0, xbrlSupplemented: 0, ibdChecks: 0, ibdPartial: 0, qualityHeld: 0,
+    xbrlError: 0, sharesFixed: 0, sharesNull: 0, priceNull: 0,
+  };
+  const engineMix: Record<string, number> = {};
   for (const s of stocks) {
-    const f = pick[s.code] ? fin[pick[s.code]!] : null;
+    const f0 = pick[s.code] ? fin[pick[s.code]!] : null;
+    if (f0) {
+      const ev = f0.engine ?? "ibd-v2.0";
+      engineMix[ev] = (engineMix[ev] ?? 0) + 1;
+      if (isXbrlRetry(f0)) stats.xbrlError += 1;
+    }
+    const held = f0 ? qualityHold(f0, lists[s.corpCode]?.docs ?? [], fin) : null;
+    const f: FinResult | null = f0 && held ? { ...f0, ibd: null, fundamentals: null, error: `데이터 품질 보류: ${held}` } : f0;
+    if (held) stats.qualityHeld += 1;
     const price = prices[s.code] ?? null;
     // DART 주식수가 없으면(주식총수 API 013 — 셀트리온·SK 등) 네이버 현재 상장주식수로 대체
     const sh0 = f?.sharesDart
@@ -353,10 +462,23 @@ function assemble(
       : sh0;
     stats.total += 1;
     if (!f) stats.noReport += 1;
-    if (f && !f.ibd && !f.ibdExcluded) stats.ibdNull += 1;
+    if (f && !f.ibd && !f.ibdExcluded && !held) stats.ibdNull += 1;
     if (f?.ibdExcluded) stats.ibdExcluded += 1;
     if (f?.xbrlSupplemented) stats.xbrlSupplemented += 1;
-    if (migrateIbdMessages(f?.ibd ?? null)?.checks?.length) stats.ibdChecks += 1;
+    // 직전 보고서 대비 경고는 출력에만 붙인다(한 실행에서 여러 기준일이 같은 레코드를 공유)
+    const ibd0 = normalizeCompactIbd(migrateIbdMessages(f?.ibd ?? null));
+    const hist = f && ibd0 && !held ? historyChecks(f, lists[s.corpCode]?.docs ?? [], fin) : { checks: [], partial: false };
+    const ibd: CompactIbd | null = ibd0 && hist.checks.length
+      ? {
+          ...ibd0,
+          checks: [...(ibd0.checks ?? []), ...hist.checks],
+          ...(hist.partial
+            ? { completeness: "partial" as const, completenessReason: [ibd0.completenessReason, "직전 보고서 대비 차입 소실"].filter(Boolean).join("; ") }
+            : {}),
+        }
+      : ibd0;
+    if (ibd?.checks?.length) stats.ibdChecks += 1;
+    if (ibd?.completeness === "partial") stats.ibdPartial += 1;
     if (sh.note?.includes("보정")) stats.sharesFixed += 1;
     if (!sh.shares) stats.sharesNull += 1;
     if (!price) stats.priceNull += 1;
@@ -369,7 +491,7 @@ function assemble(
       valuationDate: asOf,
       beta: betas[s.code] ?? { weekly: null, monthly: null },
       // 옛 판 결과(2-튜플)도 현재 형식([계정명, 금액, 범주])으로 맞춰 쓴다
-      ibd: normalizeCompactIbd(migrateIbdMessages(f?.ibd ?? null)),
+      ibd,
       ...(f?.ibdExcluded ? { ibdExcluded: f.ibdExcluded } : {}),
       nci: fu?.nci ?? null,
       pretaxIncome: fu?.pretaxIncome ?? null,
@@ -394,7 +516,7 @@ function assemble(
         : null,
     };
   }
-  return { out, stats };
+  return { out, stats, engineMix };
 }
 
 // ─── 메인 ───
@@ -425,13 +547,15 @@ async function main() {
       const betas = financialsOnly && fs.existsSync(path.join(PROGRESS_DIR, `beta-${asOf}.json`))
         ? (loadJson(path.join(PROGRESS_DIR, `beta-${asOf}.json`)) as Record<string, { weekly: BetaGrid; monthly: BetaGrid }>)
         : await collectBetas(stocks, asOf);
-      const { out, stats } = assemble(stocks, asOf, fin, pick, listed, prices, betas);
+      const { out, stats, engineMix } = assemble(stocks, asOf, fin, pick, listed, prices, betas, lists);
       const dest = outDir ?? BASE_DIR;
       ensureDir(dest);
       saveJson(path.join(dest, `${asOf}.json`), out);
       const meta = {
         valuationDate: asOf,
-        engine: ENGINE_VERSION,
+        // 선택 보고서가 모두 현재 판일 때만 현재 판 — 아니면 --latest 가 이 기준일을 다시 고른다
+        engine: Object.keys(engineMix).every((k) => k === ENGINE_VERSION) ? ENGINE_VERSION : `${ENGINE_VERSION}(혼합)`,
+        engineMix,
         generatedAt: new Date().toISOString(),
         financialsPolicy: "기준일 당시 공시된 최신 정기보고서",
         stats,

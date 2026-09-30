@@ -46,6 +46,13 @@ export interface CrossRow {
   debtStatus: Status;
   leaseStatus: Status;
   xbrlSupplemented: boolean;
+  industryCode: string;
+  completeness: "full" | "partial";
+  dedupeRemoved: number;
+  financialSegment: boolean;
+  totalLiabilities: number | null;
+  unclassifiedBs: boolean;
+  debtLike: [string, number, string][];
   checks: string[];
   lines: [string, number, string][];
   /** 엔진 차입성 − 주석 차입성(원) */
@@ -70,9 +77,10 @@ function main() {
     const c = toCompactIbd(r);
     const lines = c ? [...c.current, ...c.nonCurrent, ...(c.unclassified ?? [])] : [];
     const sumCat = (k: string) => lines.filter((l) => l[2] === k).reduce((s, l) => s + l[1], 0);
+    const core = sumCat("borrowings") + sumCat("bonds") + sumCat("convertible") + sumCat("borrowingsAndBonds");
     const eng = {
-      debt: sumCat("borrowings") + sumCat("bonds") + sumCat("otherDebt"),
-      debtExOther: sumCat("borrowings") + sumCat("bonds"),
+      debt: core + sumCat("otherDebt"),
+      debtExOther: core,
       lease: sumCat("lease"),
       otherDebt: sumCat("otherDebt"),
     };
@@ -111,6 +119,13 @@ function main() {
       debtStatus,
       leaseStatus,
       xbrlSupplemented: r.meta.xbrlSupplemented,
+      industryCode: en.industryCode,
+      completeness: r.completeness,
+      dedupeRemoved: r.meta.dedupeRemoved.length,
+      financialSegment: !!r.meta.financialSegment,
+      totalLiabilities: r.meta.totalLiabilities,
+      unclassifiedBs: r.unclassified.length > 0 || r.checks.some((c) => c.includes("유동/비유동 구분이 없는")),
+      debtLike: r.debtLike.map((d) => [d.account, d.amount, d.type] as [string, number, string]),
       checks: r.checks,
       lines,
       debtDiff: note?.debt != null ? eng.debt - note.debt : null,
@@ -133,6 +148,7 @@ function main() {
       ? Number((withNote.filter((r) => r.debtStatus === "match").length / withNote.length).toFixed(4))
       : null,
     engineChecks: rows.filter((r) => !r.excluded && r.checks.length).length,
+    partial: rows.filter((r) => !r.excluded && r.completeness === "partial").length,
   };
   fs.writeFileSync(path.join(DIR, `crosscheck-${asOf}${tag}.json`), JSON.stringify({ summary, rows }));
   console.log(JSON.stringify(summary, null, 2));

@@ -82,11 +82,13 @@ export function registerValuationDataTool(server: McpServer): void {
 
 [반환 데이터 — compact JSON]
 - beta: Weekly-2Y, Monthly-5Y — [실질베타, 조정베타, 포인트수]
-- ibd: 이자부부채 — 기본은 요약: total(총액), current/nonCurrent([범주명, 금액] — 차입금·사채·리스부채·기타 차입성 부채),
-  byCategory(범주별 합계 — 예: 리스 제외 = total − byCategory.lease). ibd_detail=true 면 lines 에 계정 행 단위 [계정명, 금액, 범주].
+- ibd: 이자부부채 — 기본은 요약: total(총액), current/nonCurrent([범주명, 금액]),
+  byCategory(범주별 합계: borrowings 차입금, bonds 사채, convertible 전환사채 등 CB·BW·EB, borrowingsAndBonds 차입금·사채 구분 불가,
+  lease 리스부채, otherDebt 유동화채무·판매후리스 등 — 예: 리스 제외 = total − byCategory.lease). ibd_detail=true 면 lines 에 계정 행 [계정명, 금액, 범주].
   재무상태표 본문 기준, 차입금이 '금융부채'로 묶인 회사는 주석 금액으로 보충. 차감계정(사채할인발행차금 등)은 본계정 범주에 음수로 합산.
-  debtLike(상환전환우선주부채·신종자본증권 등)는 합계에서 제외해 따로 표시, checks 는 원문 확인이 필요한 경고, notes 는 참고.
-  금융업(은행·보험·증권·금융지주)은 ibd=null 이고 ibdExcluded 에 사유.
+  completeness='partial'(사유 completenessReason)이면 차입 일부가 빠졌을 수 있음 — 원문 확인.
+  debtLike [계정명, 금액, 유형(계정명 기준 추정: rcps·cps·convDerivative·hybrid·unknown)]는 합계에서 제외 — 내가격 전환이면 희석, 아니면 부채 가산을 검토.
+  checks 는 원문 확인이 필요한 경고, notes 는 참고. 금융업(은행·보험·증권·여신전문·금융지주)은 ibd=null 이고 ibdExcluded 에 사유.
 - nci: 비지배지분, pretaxIncome: 세전이익
 - marketCap: { price, shares(유통주식수), total, sharesNote(주식수 보정·대체 설명) }
 - financials: 사용 보고서 + cash·shortTermDeposits·equityParent·revenue·operatingIncome·netIncomeParent·incomeTax (손익은 incomeMonths 개월 누적)

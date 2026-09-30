@@ -11,7 +11,7 @@
 import fs from "fs";
 import path from "path";
 import { selectAsOfReport } from "../src/services/opendart/report-asof";
-import { fetchFinForReport, ensureXbrlFacts } from "../src/services/valuation/asof-financials";
+import { fetchFinForReport, ensureXbrlFacts, needsXbrlFetch } from "../src/services/valuation/asof-financials";
 import { createFsRawStore } from "../src/services/valuation/raw-store-fs";
 import type { DartListDoc } from "../src/services/opendart/document-parser";
 
@@ -98,15 +98,15 @@ async function main() {
       await Promise.all(
         batch.map(async (en) => {
           const raw0 = store.get(en.rceptNo);
-          const complete = raw0 && raw0.shares && (!withXbrl || raw0.xbrl !== undefined);
+          const complete = raw0 && raw0.shares && (!withXbrl || !needsXbrlFetch(raw0));
           if (complete) return;
           network = true;
           const rep = selectAsOfReport(lists[en.corpCode]?.docs ?? [], asOf, en.accMonth)!;
           try {
             await fetchFinForReport(en, rep, apiKey, checkFatal, store, prevFin[en.rceptNo]);
             const raw = store.get(en.rceptNo);
-            if (raw && withXbrl && raw.xbrl === undefined) {
-              await ensureXbrlFacts(raw, en.reprtCode, apiKey);
+            if (raw && withXbrl && needsXbrlFetch(raw)) {
+              await ensureXbrlFacts(raw, en.reprtCode, apiKey, checkFatal);
               store.put(en.rceptNo, raw);
             }
             fetched += 1;

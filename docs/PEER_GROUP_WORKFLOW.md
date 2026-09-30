@@ -131,8 +131,10 @@ valuation_get_data(
     "total": 25239139000000,
     "current":    [["차입금", 18752488000000]],
     "nonCurrent": [["차입금", 6479517000000], ["사채", 7134000000]],
-    "byCategory": { "borrowings": 25232005000000, "bonds": 7134000000, "lease": 0, "otherDebt": 0 },
-    "debtLike": [["상환전환우선주부채", 0]],
+    "byCategory": { "borrowings": 25232005000000, "bonds": 7134000000, "convertible": 0, "borrowingsAndBonds": 0, "lease": 0, "otherDebt": 0 },
+    "debtLike": [["상환전환우선주부채", 0, "rcps"]],
+    "completeness": "partial(차입 일부가 빠졌을 가능성이 있을 때만)",
+    "completenessReason": "…",
     "checks": ["…산정 경고(있을 때만)…"],
     "lines": { "current": [["단기차입금", 17574980000000, "borrowings"], ["유동성장기부채", 1177508000000, "borrowings"]], "nonCurrent": ["…ibd_detail=true 일 때만…"] }
   },
@@ -158,7 +160,9 @@ valuation_get_data(
 - 순차입금·EV = `derived.netDebt`, `derived.enterpriseValue`
 - 손익 멀티플은 `financials.incomeMonths` 가 12가 아니면 누적 기간이므로 연환산 여부를 명시할 것
 - `ibd.debtLike`(상환전환우선주부채 등) 포함 여부는 사용자 판단 — 기본 합계에는 빠져 있음
-- 리스부채를 빼고 보려면 `ibd.total − ibd.byCategory.lease` (IFRS 16 이전 기준과 비교할 때 등). 범주: borrowings 차입금, bonds 사채(차감계정 순액), lease 리스부채, otherDebt 유동화채무·판매후리스 등
+- 리스부채를 빼고 보려면 `ibd.total − ibd.byCategory.lease` (IFRS 16 이전 기준과 비교할 때 등). 범주: borrowings 차입금, bonds 사채(차감계정 순액), convertible 전환사채·신주인수권부사채·교환사채, borrowingsAndBonds 차입금·사채를 나눌 수 없는 행, lease 리스부채, otherDebt 유동화채무·판매후리스 등
+- `ibd.completeness = "partial"` 이면 차입 일부가 빠졌을 수 있다(사유 `completenessReason`) — Peer 비교에 쓰기 전에 원문 확인
+- `ibd.debtLike` 는 `[계정명, 금액, 유형(계정명 기준 추정)]` — rcps(상환전환우선주)·cps(전환우선주)·convDerivative(전환권 파생)·hybrid(신종자본증권)·unknown. 내가격이면 희석, 아니면 부채 가산을 검토
 
 엑셀에서 사용 중이면 `response_format="table"` 같은 옵션이 없으므로 LLM이 직접 TSV/Markdown 표로 정리해 돌려주세요.
 

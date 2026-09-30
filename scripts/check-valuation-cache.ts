@@ -8,6 +8,7 @@
  */
 import fs from "fs";
 import path from "path";
+import { IBD_ENGINE_VERSION } from "../src/services/opendart/ibd-engine";
 
 const DIR = path.resolve(__dirname, "../data/valuation-cache");
 
@@ -18,11 +19,13 @@ const LIMITS = {
   sharesNull: 0.03,
   ibdChecks: 0.2, // 이자부부채 산정 경고가 붙은 종목
   sharesJump: 0.02, // 직전 분기 대비 주식수 3배 이상 변동
+  unitOutlier: 0.001, // 보류되지 않은 단위 이상 의심(자본 100배 변동·IBD 500조 초과) — 현재 엔진 판 기준일만
 };
 
 type Entry = {
   marketCap: { shares: number | null };
-  ibd: { checks?: string[] } | null;
+  ibd: { total?: number; checks?: string[] } | null;
+  financials?: { equityTotal?: number | null; error?: string } | null;
 };
 
 function load(date: string): Record<string, Entry> | null {
@@ -65,6 +68,21 @@ for (const d of dates) {
       if (a && b && (b / a > 3 || a / b > 3)) jump += 1;
     }
     rows.push([`주식수 3배 이상 변동(대비 ${prev})`, jump / n, LIMITS.sharesJump]);
+    // 현재 엔진 판 기준일만 — 옛 판 기준일이 게이트를 막지 않게
+    if (String(meta.engine).startsWith(IBD_ENGINE_VERSION)) {
+      let outlier = 0;
+      for (const [code, e] of Object.entries(cur)) {
+        if (e.financials?.error?.startsWith("데이터 품질 보류")) continue;
+        const eq = e.financials?.equityTotal;
+        const peq = before[code]?.financials?.equityTotal;
+        if ((e.ibd?.total ?? 0) > 5e14 || (eq && peq && eq > 0 && peq > 0 && (eq / peq >= 100 || eq / peq <= 0.01))) outlier += 1;
+      }
+      rows.push([`단위 이상 의심(보류 안 됨, 대비 ${prev})`, outlier / n, LIMITS.unitOutlier]);
+    }
+  }
+  if (String(meta.engine).includes("혼합")) {
+    failed = true;
+    console.log(`  ✗ 엔진 판 혼합: ${JSON.stringify(meta.engineMix)} — 옛 판 결과가 섞여 있음(재계산 필요)`);
   }
   console.log(`\n■ ${d} — ${n}종목 (${meta.engine}, ${meta.generatedAt})`);
   for (const [label, ratio, limit] of rows) {
@@ -72,7 +90,10 @@ for (const d of dates) {
     if (bad) failed = true;
     console.log(`  ${bad ? "✗" : "✓"} ${label}: ${(ratio * 100).toFixed(1)}% (한도 ${(limit * 100).toFixed(0)}%)`);
   }
-  console.log(`  · 금융업 제외 ${s.ibdExcluded}, 주석 보충 ${s.xbrlSupplemented}, 주식수 단위 보정 ${s.sharesFixed}`);
+  console.log(
+    `  · 금융업 제외 ${s.ibdExcluded}, 주석 보충 ${s.xbrlSupplemented}, 주식수 단위 보정 ${s.sharesFixed}` +
+      (s.ibdPartial != null ? `, 이자부부채 일부 누락 가능(partial) ${s.ibdPartial}, 품질 보류 ${s.qualityHeld ?? 0}` : ""),
+  );
 }
 if (!dates.length) console.log("검사할 기준일 없음(엔진 v2 캐시 없음)");
 process.exit(failed ? 1 : 0);

@@ -86,21 +86,47 @@ export function parseXbrlInstantFacts(
   return facts;
 }
 
+/**
+ * 1000바이트 미만 응답 판정 — 자료 없음(013)·파일 없음(014)만 absent, 나머지(상태 코드 없음 포함)는 오류.
+ * 메시지 앞에 'status: NNN' 을 붙여 수집기의 한도 초과(020) 감지가 동작하게 한다.
+ */
+export function classifyXbrlShortResponse(msg: string): { status: "absent" | "error"; message: string } {
+  const st = msg.match(/<status>(\d{3})<\/status>/)?.[1] ?? msg.match(/"status"\s*:\s*"(\d{3})"/)?.[1];
+  if (st === "013" || st === "014") return { status: "absent", message: msg.slice(0, 200) };
+  return { status: "error", message: `status: ${st ?? "?"} ${msg.slice(0, 200)}` };
+}
+
 export async function fetchXbrlXml(rceptNo: string, reprtCode: string, apiKey?: string): Promise<string | null> {
+  return (await fetchXbrlXmlStatus(rceptNo, reprtCode, apiKey)).xml;
+}
+
+/**
+ * XBRL 인스턴스 조회 — 없음(absent: DART 가 파일을 주지 않음)과 오류(error: 한도 초과·시간 초과·통신)를 구분한다.
+ * 오류는 원자료에 남기지 않고 다음 수집에서 다시 시도해야 한다.
+ */
+export async function fetchXbrlXmlStatus(
+  rceptNo: string,
+  reprtCode: string,
+  apiKey?: string,
+): Promise<{ status: "ok" | "absent" | "error"; xml: string | null; message?: string }> {
   const key = apiKey || process.env.OPENDART_API_KEY;
-  if (!key) return null;
+  if (!key) return { status: "error", xml: null, message: "API 키 없음" };
   try {
     const res = await axios.get(`${DART_API_BASE}/fnlttXbrl.xml`, {
       params: { crtfc_key: key, rcept_no: rceptNo, reprt_code: reprtCode },
       responseType: "arraybuffer",
       timeout: 60000,
     });
-    if (res.data.length < 1000) return null;
-    const zip = new AdmZip(Buffer.from(res.data));
+    const buf = Buffer.from(res.data);
+    if (buf.length < 1000) {
+      const c = classifyXbrlShortResponse(buf.toString("utf8"));
+      return { status: c.status, xml: null, message: c.message };
+    }
+    const zip = new AdmZip(buf);
     const entry = zip.getEntries().find((e) => e.entryName.endsWith(".xbrl"));
-    return entry ? entry.getData().toString("utf8") : null;
-  } catch {
-    return null;
+    return entry ? { status: "ok", xml: entry.getData().toString("utf8") } : { status: "absent", xml: null };
+  } catch (e) {
+    return { status: "error", xml: null, message: (e as Error).message };
   }
 }
 
@@ -117,6 +143,14 @@ export interface XbrlDebtSummary {
   leaseTotal: number | null;
   /** 유동+비유동 과 Borrowings 총계 대조 결과(없으면 null) */
   reconciles: boolean | null;
+  /** 구성 요소 — 주석 보충 행을 차입금/사채로 나누고, 총계 폴백에서 본문과 대조할 때 쓴다 */
+  currentLoans: number | null;
+  currentBonds: number | null;
+  nonCurrentLoans: number | null;
+  nonCurrentBonds: number | null;
+  borrowings: number | null;
+  loansReceived: number | null;
+  bondsIssued: number | null;
 }
 
 const sumDefined = (...xs: (number | undefined)[]) => {
@@ -149,5 +183,14 @@ export function summarizeXbrlDebt(f: XbrlFacts): XbrlDebtSummary {
     totalPartial: f.Borrowings == null && (f.LoansReceived != null || f.BondsIssued != null),
     leaseTotal: f.LeaseLiabilities ?? null,
     reconciles,
+    currentLoans:
+      f.CurrentLoansReceivedAndCurrentPortionOfNoncurrentLoansReceived ??
+      sumDefined(f.ShorttermBorrowings, f.CurrentPortionOfLongtermBorrowings),
+    currentBonds: f.CurrentBondsIssuedAndCurrentPortionOfNoncurrentBondsIssued ?? null,
+    nonCurrentLoans: f.NoncurrentPortionOfNoncurrentLoansReceived ?? null,
+    nonCurrentBonds: f.NoncurrentPortionOfNoncurrentBondsIssued ?? null,
+    borrowings: f.Borrowings ?? null,
+    loansReceived: f.LoansReceived ?? null,
+    bondsIssued: f.BondsIssued ?? null,
   };
 }
