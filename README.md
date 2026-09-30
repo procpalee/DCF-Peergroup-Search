@@ -175,8 +175,10 @@ KICPA 베타계수는 서버가 KOSCOM 페이지에서 JSESSIONID 세션 쿠키�
 
 ### 3. 배포 완료 후 MCP URL
 
+운영 주소는 `https://krvaluation.procpa.co.kr/api/mcp` 입니다(기존 `kicpa-beta-mcp.vercel.app`·`dcf-peergroup-search.vercel.app` 도 같은 배포로 연결).
+
 ```
-https://<your-app>.vercel.app/api/mcp
+https://krvaluation.procpa.co.kr/api/mcp
 ```
 
 `next.config.ts`의 `outputFileTracingIncludes` 설정으로 `data/business-cache/**/*.gz`와 `data/corp-codes.json`이 서버리스 함수 번들에 자동 포함됩니다.
@@ -190,13 +192,13 @@ https://<your-app>.vercel.app/api/mcp
 `사용자 지정` → `커넥터` → `커스텀 커넥터 추가`에서 다음 URL 등록:
 
 ```
-https://<your-app>.vercel.app/api/mcp
+https://krvaluation.procpa.co.kr/api/mcp
 ```
 
 ### Claude Code
 
 ```bash
-claude mcp add kr-valuation-data --transport http https://<your-app>.vercel.app/api/mcp
+claude mcp add kr-valuation-data --transport http https://krvaluation.procpa.co.kr/api/mcp
 ```
 
 ### MCP Inspector
@@ -205,7 +207,7 @@ claude mcp add kr-valuation-data --transport http https://<your-app>.vercel.app/
 npx @modelcontextprotocol/inspector
 ```
 
-URL에 `https://<your-app>.vercel.app/api/mcp` 입력.
+URL에 `https://krvaluation.procpa.co.kr/api/mcp` 입력.
 
 ---
 
