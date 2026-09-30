@@ -15,7 +15,8 @@
  *
  * v2.2(2026-09-30 오프라인 점검) · v2.2.1(같은 날 구현 독립 검증 반영 — W07~W31, S01~S21)
  * · v2.3(2026-10-01 주석 원문 블라인드 검증 249종목 반영 — XBRL '공시금액' 문맥, 본문에 없는 리스의 주석 보충,
- *   주석 차입금 총계 잔액 보충, 구역별 누락·재무활동부채 조정표 대조, 사용권자산 대비 리스 누락 경고).
+ *   주석 차입금 총계 잔액 보충, 구역별 누락·재무활동부채 조정표 대조, 사용권자산 대비 리스 누락 경고)
+ * · v2.3.1(보류 표본 검증 반영 — 한 구역이라도 리스가 차입금 행 안이면 리스 보충 전체 생략).
  *
  * 주의 — DART 의 ord 는 화면 표시 순서가 아니다. 형제 행은 account_id 정렬이고, 계층형 표시의
  * 자식 행만 부모 바로 뒤에 연속으로 온다. 그래서 "바로 앞 행" 같은 인접성은 계층 판정에만 쓴다.
@@ -26,7 +27,7 @@ import type { DartFinancialItem } from "./types";
 import type { XbrlDebtSummary } from "./xbrl-debt-facts";
 
 /** 엔진 판 — 수집 캐시가 이 값과 다르면 해당 보고서를 다시 계산한다 */
-export const IBD_ENGINE_VERSION = "ibd-v2.3";
+export const IBD_ENGINE_VERSION = "ibd-v2.3.1";
 
 /** 경고(checks) 중 참고(notes)로 볼 메시지 — v2.0 캐시 이관용 */
 const NOTE_PATTERNS = [/^금융 관련 업종/, /^주석 보충 적용 — 본문 '금융부채'/];
@@ -1267,7 +1268,14 @@ export function applyXbrlSupplement(res: IbdV2Result, x: XbrlDebtSummary): void 
       // 차입금 총계 태그가 리스를 품고(총계 − 유동·비유동 = 리스) 본문 차입금이 그 총계와 같으면 — 리스는 차입금 행 안(LG화학·LG에너지솔루션)
       const tagInclLease =
         x.total != null && comp > 0 && leases.some((L) => near(x.total! - comp, L, 0.05)) && bodyDebt > 0 && near(bodyDebt, x.total, 0.01);
-      if (tagInclLease) {
+      // 어느 한 구역이라도 본문 차입이 주석 차입보다 딱 그 구역 리스만큼 많으면 — 회사가 리스를 차입금 행에 넣어 표시(한국타이어)
+      const sectionInclLease = (["current", "nonCurrent"] as const).some((s) => {
+        const amt = s === "current" ? x.leaseCurrent : x.leaseNonCurrent;
+        const noteS = s === "current" ? x.current : x.nonCurrent;
+        const bodyS = bodyDebtOf(res[s]);
+        return !!amt && amt > 0 && noteS != null && bodyS > 0 && near(bodyS - noteS, amt, 0.05);
+      });
+      if (tagInclLease || sectionInclLease) {
         res.notes.push(`본문 차입금(${eok(bodyDebt)})이 리스를 품은 주석 차입금 총계와 같음 — 리스가 차입금 행에 포함된 것으로 보고 리스 보충 생략`);
       } else if (noteDebt != null && noteDebt > 0 && bodyDebt > 0 && near(bodyDebt, both, 0.01) && !near(bodyDebt, noteDebt, 0.01)) {
         res.notes.push(`본문 차입금(${eok(bodyDebt)})이 주석 차입금+리스와 같음 — 리스가 차입금 행에 포함된 것으로 보고 리스 보충 생략`);

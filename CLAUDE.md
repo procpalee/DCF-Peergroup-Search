@@ -32,7 +32,13 @@ Caches and builders (all under `data/`, loaded via `process.cwd()`-relative path
   Interest-bearing debt uses **IBD engine v2** (`ibd-engine.ts`): balance-sheet face rows, section by the 유동부채/비유동부채 header rows (never by name substrings),
   XBRL note supplement when borrowings are bundled into "금융부채" (`xbrl-debt-facts.ts`), financial-industry exclusion, debt-like items split out.
   Shared logic for the collector and the live tool path lives in `src/services/valuation/asof-financials.ts`.
-  Regression: `npm run test:ibd` (fixtures in `tests/fixtures/ibd`, expectations in `tests/ibd-expected.json`). Quality gate: `scripts/check-valuation-cache.ts`.
+  Policy (what counts as IBD, categories, partial/hold rules): `docs/IBD_POLICY.md` — keep engine and policy in sync.
+  Engine is now v2.3: XBRL '공시금액'(ReportedAmountMember) contexts, lease-from-notes when the face has no lease row, note-total residual fill, `completeness: "partial"` when debt may be missing.
+  Raw store: `data/valuation-cache/_shared/raw/{date}/{rcept}.json.gz` (BS/IS rows + XBRL facts + shares, gitignored) — recompute without DART;
+  bumping `IBD_ENGINE_VERSION` makes the collector recompute every report (offline when raw exists).
+  Independent verification tools (DART-heavy, run locally): `ibd-corpus.ts` (all-company raw), `ibd-notes.ts` (note text for a sample),
+  `ibd-crosscheck.ts`, `ibd-sample.ts` (tuning/holdout), `ibd-gold.ts` (compare engine vs blind-audit gold labels, export gold fixtures).
+  Regression: `npm run test:ibd` (fixtures in `tests/fixtures/ibd` + `tests/fixtures/ibd-gold`, expectations in `tests/ibd-expected.json`, synthetic rule cases). Quality gate: `scripts/check-valuation-cache.ts`.
 - Data files are read through `src/services/cache/data-files.ts` (bundle first, then Vercel Blob at `KVD_BLOB_BASE_URL`); `data/manifest.json`
   (`scripts/build-data-manifest.ts`) lists dates that exist only in Blob. Upload with `scripts/upload-data-blob.ts`.
 - Automation: `.github/workflows/collect-quarterly.yml` (quarter-end collection, resumable across DART daily limits via actions/cache) and
