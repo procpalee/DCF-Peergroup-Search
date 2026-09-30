@@ -1,0 +1,17 @@
+{
+  "valuationDate": "20250630",
+  "engine": "ibd-v2.1",
+  "generatedAt": "2026-09-30T08:04:54.294Z",
+  "financialsPolicy": "기준일 당시 공시된 최신 정기보고서",
+  "stats": {
+    "total": 2550,
+    "noReport": 13,
+    "ibdNull": 1,
+    "ibdExcluded": 56,
+    "xbrlSupplemented": 35,
+    "ibdChecks": 252,
+    "sharesFixed": 5,
+    "sharesNull": 0,
+    "priceNull": 0
+  }
+}
