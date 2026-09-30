@@ -18,6 +18,21 @@
 import type { DartFinancialItem } from "./types";
 import type { XbrlDebtSummary } from "./xbrl-debt-facts";
 
+/** 엔진 판 — 수집 캐시가 이 값과 다르면 해당 보고서를 다시 계산할 수 있다 */
+export const IBD_ENGINE_VERSION = "ibd-v2.1";
+
+/** 경고(checks) 중 참고(notes)로 볼 메시지 — v2.0 캐시 이관용 */
+const NOTE_PATTERNS = [/^금융 관련 업종/, /^주석 보충 적용 — 본문 '금융부채'/];
+
+export function migrateIbdMessages<T extends { checks?: string[]; notes?: string[] }>(ibd: T | null): T | null {
+  if (!ibd?.checks?.length) return ibd;
+  const moved = ibd.checks.filter((c) => NOTE_PATTERNS.some((p) => p.test(c)));
+  if (!moved.length) return ibd;
+  const checks = ibd.checks.filter((c) => !moved.includes(c));
+  const { checks: _c, ...rest } = ibd;
+  return { ...rest, ...(checks.length ? { checks } : {}), notes: [...(ibd.notes ?? []), ...moved] } as T;
+}
+
 export type IbdCategory = "borrowings" | "bonds" | "lease" | "otherDebt" | "contra";
 export type IbdSection = "current" | "nonCurrent" | "unclassified";
 
@@ -38,7 +53,10 @@ export interface IbdV2Result {
   total: number;
   /** 합계에 넣지 않은 부채성 항목 — 포함 여부는 사용자가 판단 */
   debtLike: { account: string; amount: number; section: IbdSection }[];
+  /** 산정 경고 — 원문 확인이 필요한 경우 */
   checks: string[];
+  /** 참고 — 정상 처리지만 알아 둘 사항(주석 보충 적용, 금융 관련 업종 등) */
+  notes: string[];
   meta: {
     fsDiv: string | null;
     rceptNo: string | null;
@@ -154,6 +172,7 @@ export function computeIbdV2(items: DartFinancialItem[], opts: IbdEngineOptions 
     total: 0,
     debtLike: [],
     checks: [],
+    notes: [],
     meta: {
       fsDiv: bs[0]?.fs_div ?? null,
       rceptNo: bs[0]?.rcept_no ?? null,
@@ -186,7 +205,7 @@ export function computeIbdV2(items: DartFinancialItem[], opts: IbdEngineOptions 
   }
   if (!hasSections) res.checks.push("유동/비유동 구분이 없는 재무상태표 — 항목을 미구분으로 집계");
   if (opts.industryCode && /^6[4-6]/.test(opts.industryCode) && !opts.industryCode.startsWith("64992"))
-    res.checks.push(`금융 관련 업종(${opts.industryCode}) — 이자부부채 해석에 주의`);
+    res.notes.push(`금융 관련 업종(${opts.industryCode}) — 이자부부채 해석에 주의`);
 
   let section: IbdSection | null = hasSections ? null : "unclassified";
   const sectionSum = { current: 0, nonCurrent: 0 };
@@ -317,17 +336,27 @@ export function applyXbrlSupplement(res: IbdV2Result, x: XbrlDebtSummary): void 
     res.total += x.total;
     applied = true;
   }
+  // 유동/비유동 구분 없이 리스 총계만 있으면 미구분으로(본문에 리스 행이 없을 때만)
+  if (x.leaseCurrent == null && x.leaseNonCurrent == null && x.leaseTotal && x.leaseTotal > 0 &&
+      ![...res.current, ...res.nonCurrent, ...res.unclassified].some((l) => l.category === "lease")) {
+    res.unclassified.push({ account: "리스부채(주석, 유동/비유동 미구분)", amount: x.leaseTotal, category: "lease", accountId: "xbrl-note" });
+    res.total += x.leaseTotal;
+  }
   res.checks = res.checks.filter((c) => !c.includes("주석(XBRL) 보충 필요"));
   if (!applied) {
-    res.checks.push("주석에서도 차입금·사채 금액을 찾지 못함 — 포괄 금융부채에 차입이 없거나 비표준 태그");
+    // 무차입 회사의 '기타금융부채'(미지급·보증금 등)가 대부분이라, 묶인 금액이 부채의 30% 이상일 때만 경고
+    const liab = (res.meta.sectionTotals.current ?? 0) + (res.meta.sectionTotals.nonCurrent ?? 0);
+    const aggSum = (agg.current ?? 0) + (agg.nonCurrent ?? 0);
+    const msg = "주석에서도 차입금·사채 금액을 찾지 못함 — 포괄 금융부채에 차입이 없거나 비표준 태그";
+    if (liab > 0 && aggSum / liab >= 0.3) res.checks.push(`${msg} (금융부채가 부채의 ${Math.round((aggSum / liab) * 100)}%)`);
+    else res.notes.push(msg);
     return;
   }
   res.meta.xbrlSupplemented = true;
-  res.checks.push(
-    x.reconciles === false
-      ? "주석 보충 적용 — 주석 차입금 총계와 유동+비유동 불일치, 원문 확인 필요"
-      : "주석 보충 적용 — 본문 '금융부채' 안의 차입금·사채·리스를 주석 금액으로 산정",
-  );
+  if (x.reconciles === false) res.checks.push("주석 보충 적용 — 주석 차입금 총계와 유동+비유동 불일치, 원문 확인 필요");
+  else if (x.current == null && x.nonCurrent == null && x.totalPartial)
+    res.checks.push("주석 보충 적용 — 차입금(LoansReceived)·사채(BondsIssued) 합계로 산정, 유동/비유동 미구분 — 원문 확인 권장");
+  else res.notes.push("주석 보충 적용 — 본문 '금융부채' 안의 차입금·사채·리스를 주석 금액으로 산정");
   for (const s of ["current", "nonCurrent"] as const) {
     const a = agg[s];
     const debt = res[s].filter((l) => l.accountId === "xbrl-note").reduce((p, l) => p + l.amount, 0);
@@ -346,6 +375,7 @@ export function toCompactIbd(r: IbdV2Result) {
     total: r.total,
     ...(r.debtLike.length ? { debtLike: r.debtLike.map((d) => [d.account, d.amount] as [string, number]) } : {}),
     ...(r.checks.length ? { checks: r.checks } : {}),
+    ...(r.notes.length ? { notes: r.notes } : {}),
   };
 }
 

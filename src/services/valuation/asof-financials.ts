@@ -8,7 +8,7 @@
  *  4. 주식수 — 해당 보고서 → (3분기면) 같은 해 반기 → 직전 사업보고서
  */
 import { fetchFinancials, fetchStockQuantity, extractSharesInfo } from "../opendart/client";
-import { computeIbdV2, applyXbrlSupplement, toCompactIbd } from "../opendart/ibd-engine";
+import { computeIbdV2, applyXbrlSupplement, toCompactIbd, IBD_ENGINE_VERSION } from "../opendart/ibd-engine";
 import { fetchXbrlXml, parseXbrlDebtFacts, summarizeXbrlDebt } from "../opendart/xbrl-debt-facts";
 import { fetchPeriodicReports, selectAsOfReport, monthsBeforeDate, type AsOfReport } from "../opendart/report-asof";
 import { extractFundamentals, type Fundamentals } from "../opendart/fundamentals";
@@ -22,6 +22,8 @@ export interface FinResult {
   sharesDart: number | null;
   /** 주식수를 다른 보고서에서 가져왔으면 그 보고서 */
   sharesSource?: string;
+  /** 계산한 이자부부채 엔진 판(IBD_ENGINE_VERSION) */
+  engine?: string;
   error?: string;
 }
 
@@ -42,6 +44,7 @@ export function emptyFin(rep: AsOfReport, error?: string): FinResult {
     xbrlSupplemented: false,
     fundamentals: null,
     sharesDart: null,
+    engine: IBD_ENGINE_VERSION,
     ...(error ? { error } : {}),
   };
 }

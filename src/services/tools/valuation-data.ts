@@ -42,8 +42,10 @@ interface CompactIBD {
   total: number;
   /** 합계에서 뺀 부채성 항목(상환전환우선주부채·신종자본증권 등) */
   debtLike?: [string, number][];
-  /** 산정 경고(구역 합계 불일치, 주석 보충 등) */
+  /** 산정 경고 — 원문 확인이 필요한 경우 */
   checks?: string[];
+  /** 참고 — 정상 처리지만 알아 둘 사항(주석 보충 적용 등) */
+  notes?: string[];
 }
 
 export interface CompactResult {
@@ -87,7 +89,7 @@ export function registerValuationDataTool(server: McpServer): void {
 [반환 데이터 — compact JSON]
 - beta: Weekly-2Y, Monthly-5Y — [실질베타, 조정베타, 포인트수]
 - ibd: 이자부부채 유동/비유동 [계정명, 금액] — 재무상태표 본문 기준, 차입금이 '금융부채'로 묶인 회사는 주석 금액으로 보충.
-  debtLike(상환전환우선주부채·신종자본증권 등)는 합계에서 제외해 따로 표시, checks 는 산정 경고.
+  debtLike(상환전환우선주부채·신종자본증권 등)는 합계에서 제외해 따로 표시, checks 는 원문 확인이 필요한 경고, notes 는 참고.
   금융업(은행·보험·증권·금융지주)은 ibd=null 이고 ibdExcluded 에 사유.
 - nci: 비지배지분, pretaxIncome: 세전이익
 - marketCap: { price, shares(유통주식수), total, sharesNote(주식수 보정·대체 설명) }

@@ -39,6 +39,9 @@ const WANTED = new Set([
   "CurrentLeaseLiabilities",
   "NoncurrentLeaseLiabilities",
   "LeaseLiabilities",
+  // 유동/비유동 구분 태그가 없는 회사의 대체 총액(LG디스플레이 2025 등)
+  "LoansReceived",
+  "BondsIssued",
 ]);
 
 /**
@@ -59,7 +62,9 @@ export function parseXbrlDebtFacts(xml: string, year: string | null, scope: Xbrl
   for (const m of xml.matchAll(re)) {
     const [, el, ctx, v] = m;
     if (ctx !== chosen.id || !WANTED.has(el)) continue;
-    facts[el] = Number(v);
+    // 같은 요소가 같은 문맥에 여러 번 태깅되면(주석 표마다 부분합 — LG디스플레이 2025 LoansReceived 8.31조·12.14조)
+    // 큰 값(총액)을 쓴다
+    facts[el] = Math.max(facts[el] ?? -Infinity, Number(v));
   }
   return facts;
 }
@@ -87,8 +92,12 @@ export interface XbrlDebtSummary {
   nonCurrent: number | null;
   leaseCurrent: number | null;
   leaseNonCurrent: number | null;
-  /** 차입금 총계(Borrowings) — 유동/비유동 구분 태그가 없을 때 대체용 */
+  /** 차입금 총계 — Borrowings, 없으면 LoansReceived + BondsIssued (유동/비유동 구분 태그가 없을 때 대체용) */
   total: number | null;
+  /** total 을 LoansReceived·BondsIssued 로 만들었으면 true — 포괄 범위가 회사마다 달라 원문 확인 권장 */
+  totalPartial: boolean;
+  /** 리스부채 총계(유동/비유동 구분 없을 때) */
+  leaseTotal: number | null;
   /** 유동+비유동 과 Borrowings 총계 대조 결과(없으면 null) */
   reconciles: boolean | null;
 }
@@ -119,7 +128,9 @@ export function summarizeXbrlDebt(f: XbrlFacts): XbrlDebtSummary {
     nonCurrent,
     leaseCurrent: f.CurrentLeaseLiabilities ?? null,
     leaseNonCurrent: f.NoncurrentLeaseLiabilities ?? null,
-    total: f.Borrowings ?? null,
+    total: f.Borrowings ?? sumDefined(f.LoansReceived, f.BondsIssued),
+    totalPartial: f.Borrowings == null && (f.LoansReceived != null || f.BondsIssued != null),
+    leaseTotal: f.LeaseLiabilities ?? null,
     reconciles,
   };
 }

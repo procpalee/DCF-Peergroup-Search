@@ -23,13 +23,13 @@ import path from "path";
 import { fetchHistoricalPrices, fetchMarketData } from "../src/services/naver/client";
 import { computeBetaGridBatch } from "../src/services/beta-calc";
 import { getIndustryName } from "../src/services/opendart/ksic-codes";
-import { sanitizeShares } from "../src/services/opendart/ibd-engine";
+import { sanitizeShares, migrateIbdMessages, IBD_ENGINE_VERSION } from "../src/services/opendart/ibd-engine";
 import { fetchPeriodicReports, selectAsOfReport, monthsBeforeDate, type AsOfReport } from "../src/services/opendart/report-asof";
 import { fetchFinForReport, emptyFin, type FinResult } from "../src/services/valuation/asof-financials";
 import type { DartListDoc } from "../src/services/opendart/document-parser";
 
 // ─── 설정 ───
-const ENGINE_VERSION = "ibd-v2.0";
+const ENGINE_VERSION = IBD_ENGINE_VERSION;
 const DART_BATCH_SIZE = 3;
 const DART_DELAY_MS = 1000; // 분당 ~180회
 const NAVER_CONCURRENCY = 10;
@@ -190,6 +190,13 @@ async function ensureReportLists(stocks: Stock[], through: string): Promise<Reco
 
 // ─── 2. 재무 ───
 
+/** 이전 엔진 판 결과 중 주석 보충 경로를 탄 보고서만 다시 계산(나머지는 결과 동일 — 메시지만 이관) */
+function needsRecompute(f: FinResult): boolean {
+  if (f.engine === ENGINE_VERSION) return false;
+  const msgs = [...(f.ibd?.checks ?? []), ...(f.ibd?.notes ?? [])];
+  return msgs.some((m) => m.includes("주석"));
+}
+
 async function collectFinancials(stocks: Stock[], asOf: string, lists: Record<string, ListsEntry>) {
   const fin: Record<string, FinResult> = loadJson(FIN_PATH) ?? {};
   const pick: Record<string, string | null> = {}; // code → rcept_no
@@ -197,7 +204,7 @@ async function collectFinancials(stocks: Stock[], asOf: string, lists: Record<st
   for (const s of stocks) {
     const rep = selectAsOfReport(lists[s.corpCode]?.docs ?? [], asOf, s.accMonth);
     pick[s.code] = rep?.rceptNo ?? null;
-    if (rep && !fin[rep.rceptNo]) todo.push({ s, rep });
+    if (rep && (!fin[rep.rceptNo] || needsRecompute(fin[rep.rceptNo]))) todo.push({ s, rep });
   }
   console.log(`[재무 ${asOf}] 보고서 선택 ${Object.values(pick).filter(Boolean).length}/${stocks.length}, 신규 수집 ${todo.length}`);
   let done = 0;
@@ -328,7 +335,7 @@ function assemble(
     if (f && !f.ibd && !f.ibdExcluded) stats.ibdNull += 1;
     if (f?.ibdExcluded) stats.ibdExcluded += 1;
     if (f?.xbrlSupplemented) stats.xbrlSupplemented += 1;
-    if (f?.ibd && "checks" in f.ibd) stats.ibdChecks += 1;
+    if (migrateIbdMessages(f?.ibd ?? null)?.checks?.length) stats.ibdChecks += 1;
     if (sh.note?.includes("보정")) stats.sharesFixed += 1;
     if (!sh.shares) stats.sharesNull += 1;
     if (!price) stats.priceNull += 1;
@@ -340,7 +347,7 @@ function assemble(
       year: f?.report.bsnsYear ?? null,
       valuationDate: asOf,
       beta: betas[s.code] ?? { weekly: null, monthly: null },
-      ibd: f?.ibd ?? null,
+      ibd: migrateIbdMessages(f?.ibd ?? null),
       ...(f?.ibdExcluded ? { ibdExcluded: f.ibdExcluded } : {}),
       nci: fu?.nci ?? null,
       pretaxIncome: fu?.pretaxIncome ?? null,
