@@ -26,7 +26,8 @@ export function createFsRawStore(dir: string = DEFAULT_RAW_DIR): RawStore & { ha
     put(r, raw) {
       const f = file(r);
       fs.mkdirSync(path.dirname(f), { recursive: true });
-      const tmp = `${f}.tmp`;
+      // 프로세스마다 다른 임시 파일 — 두 수집이 겹쳐도 서로의 임시 파일을 덮지 않게
+      const tmp = `${f}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
       fs.writeFileSync(tmp, zlib.gzipSync(JSON.stringify(raw)));
       fs.renameSync(tmp, f);
     },

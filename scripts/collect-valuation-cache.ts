@@ -222,6 +222,8 @@ const isXbrlRetry = (f: FinResult) =>
 function needsRecompute(f: FinResult, _rceptNo: string): boolean {
   if (RECOMPUTE_ALL) return true;
   if (isXbrlRetry(f)) return true;
+  // 일시 오류(시간 초과·파일 충돌 등)로 끝난 결과는 다시 — '재무제표 없음'은 확정 결과
+  if (f.error && !f.ibd && !/재무제표 없음|데이터 품질 보류/.test(f.error)) return true;
   return f.engine !== ENGINE_VERSION;
 }
 

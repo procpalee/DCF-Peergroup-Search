@@ -25,7 +25,7 @@ const LIMITS = {
 type Entry = {
   marketCap: { shares: number | null };
   ibd: { total?: number; checks?: string[] } | null;
-  financials?: { equityTotal?: number | null; error?: string } | null;
+  financials?: { equityTotal?: number | null; cash?: number | null; error?: string } | null;
 };
 
 function load(date: string): Record<string, Entry> | null {
@@ -73,9 +73,18 @@ for (const d of dates) {
       let outlier = 0;
       for (const [code, e] of Object.entries(cur)) {
         if (e.financials?.error?.startsWith("데이터 품질 보류")) continue;
+        // 수집기 보류 규칙과 같은 기준 — 자본이 100배 변하고 IBD(무차입이면 현금)도 같은 배율일 때만 단위 오류로 본다
         const eq = e.financials?.equityTotal;
         const peq = before[code]?.financials?.equityTotal;
-        if ((e.ibd?.total ?? 0) > 5e14 || (eq && peq && eq > 0 && peq > 0 && (eq / peq >= 100 || eq / peq <= 0.01))) outlier += 1;
+        const same = (a?: number | null, b?: number | null, r = 1) => !!a && !!b && a > 0 && b > 0 && a / b >= r * 0.5 && a / b <= r * 2;
+        let jump = false;
+        if (eq && peq && eq > 0 && peq > 0 && (eq / peq >= 100 || eq / peq <= 0.01)) {
+          const r = eq / peq;
+          const it = e.ibd?.total ?? 0;
+          const pt = before[code]?.ibd?.total ?? 0;
+          jump = it > 0 && pt > 0 ? same(it, pt, r) : same(e.financials?.cash, before[code]?.financials?.cash, r);
+        }
+        if ((e.ibd?.total ?? 0) > 5e14 || jump) outlier += 1;
       }
       rows.push([`단위 이상 의심(보류 안 됨, 대비 ${prev})`, outlier / n, LIMITS.unitOutlier]);
     }
