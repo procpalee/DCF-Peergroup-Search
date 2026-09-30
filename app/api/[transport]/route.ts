@@ -35,7 +35,14 @@ const handler = createMcpHandler(
     // Peer 모집단 결정론적 조회 (분기말 스냅샷)
     registerPeergroupPopulationTool(server);
   },
-  {},
+  {
+    serverInfo: { name: "kr-valuation-data", version: "2.0.0" },
+    instructions:
+      "한국 상장사 밸류에이션 데이터 서버. 분기말 기준 베타·이자부부채·시가총액·현금·실적(valuation_get_data), " +
+      "결정론적 Peer 모집단(peergroup_get_population), 업종 검색·사업보고서 본문을 제공한다. " +
+      "재무는 평가기준일 당시 공시된 최신 정기보고서 기준이며, 사용 보고서가 응답에 표시된다. " +
+      "Peer 분석 순서는 docs/PEER_GROUP_WORKFLOW.md 를 따른다.",
+  },
   {
     basePath: "/api",
     maxDuration: 60,

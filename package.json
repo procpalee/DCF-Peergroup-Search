@@ -1,12 +1,14 @@
 {
-  "name": "kicpa-beta-mcp-server",
-  "version": "1.0.0",
-  "description": "MCP server for KICPA/KOSCOM CHECKExpert+ Beta coefficient lookup service",
+  "name": "kr-valuation-data",
+  "version": "2.0.0",
+  "description": "한국 상장사 밸류에이션 데이터 MCP 서버 — 베타·이자부부채·시가총액·재무·Peer 모집단(분기말 자동 수집)",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "collect:peer-snapshot": "tsx scripts/collect-peer-snapshot.ts"
+    "collect:peer-snapshot": "tsx scripts/collect-peer-snapshot.ts",
+    "collect:valuation": "tsx scripts/collect-valuation-cache.ts",
+    "test:ibd": "tsx scripts/test-ibd-engine.ts"
   },
   "engines": {
     "node": ">=18"
@@ -27,6 +29,7 @@
     "@types/adm-zip": "^0.5.8",
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
+    "@vercel/blob": "^1.1.1",
     "typescript": "^5.7.2"
   }
 }

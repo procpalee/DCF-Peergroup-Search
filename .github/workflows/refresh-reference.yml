@@ -1,0 +1,43 @@
+# 매주 기준정보 갱신 — DART 기업코드, 업종·시장구분·결산월·상장일
+# 신규 상장·상장폐지·업종 변경을 다음 분기 수집 전에 반영한다.
+
+name: 기준정보 주간 갱신
+
+on:
+  schedule:
+    # 매주 월요일 06:00 KST (일요일 21:00 UTC)
+    - cron: "0 21 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-reference
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: DART 기업코드
+        env:
+          OPENDART_API_KEY: ${{ secrets.OPENDART_API_KEY }}
+        run: npx tsx scripts/update-corp-codes.ts
+      - name: 업종·시장구분
+        env:
+          OPENDART_API_KEY: ${{ secrets.OPENDART_API_KEY }}
+        run: npx tsx scripts/update-industry-data.ts
+      - name: 커밋·푸시
+        run: |
+          git config user.name "kr-valuation-data bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/corp-codes.json data/company-industry.json
+          if git diff --cached --quiet; then echo "변경 없음"; else git commit -m "data: 기준정보 주간 갱신 $(date -u +%Y-%m-%d)" && git push; fi

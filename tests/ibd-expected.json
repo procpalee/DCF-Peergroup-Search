@@ -1,0 +1,208 @@
+{
+  "000660-2025-11011.json": {
+    "name": "에스케이하이닉스(주)",
+    "excluded": false,
+    "total": 24757848000000,
+    "currentTotal": 8709053000000,
+    "nonCurrentTotal": 16048795000000,
+    "mustInclude": [
+      "차입금",
+      "리스부채"
+    ],
+    "note": "v1 은 리스부채만 인식(2.5조) — 차입금 포함 24.8조"
+  },
+  "003550-2025-11011.json": {
+    "name": "(주)LG",
+    "excluded": false,
+    "total": 785512000000,
+    "currentTotal": 332965000000,
+    "nonCurrentTotal": 452547000000
+  },
+  "005380-2025-11011.json": {
+    "name": "현대자동차(주)",
+    "excluded": false,
+    "total": 176514918000000,
+    "currentTotal": 44502027000000,
+    "nonCurrentTotal": 132012891000000
+  },
+  "005490-2025-11011.json": {
+    "name": "포스코홀딩스(주)",
+    "excluded": false,
+    "total": 28492000090733,
+    "currentTotal": 12117421879741,
+    "nonCurrentTotal": 16374578210992
+  },
+  "005930-2025-11011.json": {
+    "name": "삼성전자(주)",
+    "excluded": false,
+    "total": 25239139000000,
+    "currentTotal": 18752488000000,
+    "nonCurrentTotal": 6486651000000,
+    "mustInclude": [
+      "단기차입금",
+      "유동성장기부채",
+      "장기차입금"
+    ],
+    "note": "단기차입금이 비표준 ID"
+  },
+  "010130-2025-11011.json": {
+    "name": "고려아연(주)",
+    "excluded": false,
+    "total": 5805010093801,
+    "currentTotal": 3136064153850,
+    "nonCurrentTotal": 2668945939951
+  },
+  "012450-2025-11011.json": {
+    "name": "한화에어로스페이스(주)",
+    "excluded": false,
+    "total": 12825374363000,
+    "currentTotal": 7065610862000,
+    "nonCurrentTotal": 5759763501000
+  },
+  "015760-2025-11011.json": {
+    "name": "한국전력공사(주)",
+    "excluded": false,
+    "total": 132920172000000,
+    "currentTotal": 46397075000000,
+    "nonCurrentTotal": 86523097000000,
+    "mustInclude": [
+      "차입금·사채(주석)"
+    ],
+    "note": "본문 '금융부채' 묶음 → 주석 보충. 주석 Borrowings 129.77조 + 리스 3.15조"
+  },
+  "028260-2025-11011.json": {
+    "name": "삼성물산(주)",
+    "excluded": false,
+    "total": 3391618637418,
+    "currentTotal": 1780295670081,
+    "nonCurrentTotal": 1611322967337
+  },
+  "034020-2025-11011.json": {
+    "name": "두산에너빌리티(주)",
+    "excluded": false,
+    "total": 6234522000000,
+    "currentTotal": 3030446000000,
+    "nonCurrentTotal": 3204076000000,
+    "mustInclude": [
+      "판매후리스부채",
+      "장기유동화채무"
+    ],
+    "mustExclude": [
+      "예수보증금",
+      "확정계약부채"
+    ]
+  },
+  "034730-2025-11011.json": {
+    "name": "SK(주)",
+    "excluded": false,
+    "total": 72200759000000,
+    "currentTotal": 26654746000000,
+    "nonCurrentTotal": 45546013000000,
+    "note": "비금융 지주(64992) — 산정"
+  },
+  "035420-2025-11011.json": {
+    "name": "네이버(주)",
+    "excluded": false,
+    "total": 4173496645819,
+    "currentTotal": 1962370021594,
+    "nonCurrentTotal": 2211126624225
+  },
+  "035720-2025-11011.json": {
+    "name": "(주)카카오",
+    "excluded": false,
+    "total": 4025899513162,
+    "currentTotal": 1475704838136,
+    "nonCurrentTotal": 2550194675026,
+    "mustExclude": [
+      "예수부채",
+      "보험계약부채"
+    ]
+  },
+  "051910-2025-11011.json": {
+    "name": "(주)LG화학",
+    "excluded": false,
+    "total": 33811957000000,
+    "currentTotal": 11738137000000,
+    "nonCurrentTotal": 22073820000000
+  },
+  "068270-2025-11011.json": {
+    "name": "(주)셀트리온",
+    "excluded": false,
+    "total": 3341469195000,
+    "currentTotal": 3316401769000,
+    "nonCurrentTotal": 25067426000,
+    "mustInclude": [
+      "차입금·사채(주석)"
+    ],
+    "note": "본문 '단기금융부채' 묶음 → 주석 보충"
+  },
+  "103230-2025-11011.json": {
+    "name": "(주)에스앤더블류",
+    "excluded": false,
+    "total": 15720643499,
+    "currentTotal": 860643499,
+    "nonCurrentTotal": 14860000000
+  },
+  "105560-2025-11011.json": {
+    "name": "(주)KB금융지주",
+    "excluded": true,
+    "total": 0,
+    "currentTotal": 0,
+    "nonCurrentTotal": 0
+  },
+  "106520-2025-11011.json": {
+    "excluded": false,
+    "total": 5486604349,
+    "currentTotal": 5400538421,
+    "nonCurrentTotal": 86065928
+  },
+  "111380-2025-11011.json": {
+    "name": "(주)동인기연",
+    "excluded": false,
+    "total": 91777350728,
+    "currentTotal": 58402350725,
+    "nonCurrentTotal": 33375000003
+  },
+  "138040-2025-11011.json": {
+    "name": "(주)메리츠금융지주",
+    "excluded": true,
+    "total": 0,
+    "currentTotal": 0,
+    "nonCurrentTotal": 0
+  },
+  "207940-2025-11011.json": {
+    "name": "삼성바이오로직스(주)",
+    "excluded": false,
+    "total": 927094458885,
+    "currentTotal": 326970679758,
+    "nonCurrentTotal": 600123779127
+  },
+  "229640-2025-11011.json": {
+    "name": "엘에스에코에너지 주식회사",
+    "excluded": false,
+    "total": 138199866070,
+    "currentTotal": 136602908078,
+    "nonCurrentTotal": 1596957992
+  },
+  "258790-2025-11011.json": {
+    "name": "소프트캠프(주)",
+    "excluded": false,
+    "total": 19364255202,
+    "currentTotal": 5364255202,
+    "nonCurrentTotal": 14000000000
+  },
+  "373220-2025-11011.json": {
+    "name": "(주)엘지에너지솔루션",
+    "excluded": false,
+    "total": 22512096000000,
+    "currentTotal": 6686206000000,
+    "nonCurrentTotal": 15825890000000
+  },
+  "377300-2025-11011.json": {
+    "name": "주식회사 카카오페이",
+    "excluded": false,
+    "total": 132308343330,
+    "currentTotal": 58152822314,
+    "nonCurrentTotal": 74155521016
+  }
+}

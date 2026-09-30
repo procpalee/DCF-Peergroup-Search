@@ -108,36 +108,41 @@ get_business_content(stock_code="000660", year="2025")   # 최종 후보 확인�
 ```
 valuation_get_data(
   stock_codes=["005930", "000660", "042700", "240810", "005070"],
-  valuation_date="20251231",
-  year="2025"
+  valuation_date="20251231"
 )
 ```
 
 #### ⚠️ 파라미터 규칙
 - `stock_codes`: **최대 10개** 배열. 단일 종목은 문자열도 허용.
-- `valuation_date`: **반드시 분기말**(`YYYY0331` / `YYYY0630` / `YYYY0930` / `YYYY1231`) 중 하나. 이외 날짜는 캐시 miss → 느림.
-- `year`: **반드시 `valuation_date`의 연도와 동일**. 예: `20251231` → `"2025"` (관습적으로 "작년"이라 생각해 `"2024"`를 넣지 마세요).
+- `valuation_date`: 분기말(`YYYY0331` / `YYYY0630` / `YYYY0930` / `YYYY1231`)이면 캐시로 즉시 응답. 그 외 날짜도 같은 규칙으로 실시간 계산(느림).
+- `year`: 더 이상 쓰지 않습니다. 재무는 **평가기준일 당시 공시된 최신 정기보고서**로 자동 선택되고(예: 20250630 → 2025 1분기보고서), `financials.report` 에 표시됩니다.
 
 #### 반환 포맷 (compact JSON — 종목당)
 ```json
 {
   "code": "005930",
   "name": "삼성전자",
-  "industry": { "code": "26429", "name": "..." },
+  "industry": { "code": "264", "name": "..." },
   "year": "2025",
   "valuationDate": "20251231",
-  "beta": {
-    "weekly":  { "1Y": [raw, adjusted, dataPoints], "2Y": [...], "3Y": [...], "5Y": [...] },
-    "monthly": { "1Y": [...], "2Y": [...], "3Y": [...], "5Y": [...] }
-  },
+  "beta": { "weekly": { "2Y": [raw, adjusted, dataPoints] }, "monthly": { "5Y": [raw, adjusted, dataPoints] } },
   "ibd": {
-    "current":    [["단기차입금", 12345], ["유동성장기부채", 678]],
-    "nonCurrent": [["사채", 90000], ...],
-    "total": 123456
+    "current":    [["단기차입금", 17574980000000], ["유동성장기부채", 1177508000000]],
+    "nonCurrent": [["사채", 7134000000], ["장기차입금", 6479517000000]],
+    "total": 25239139000000,
+    "debtLike": [["상환전환우선주부채", 0]],
+    "checks": ["…산정 경고(있을 때만)…"]
   },
+  "ibdExcluded": "금융업일 때만 — 산정 제외 사유",
   "nci": 1234,
   "pretaxIncome": 56789,
-  "marketCap": { "price": 72000, "shares": 5969782550, "total": 429824343600000 }
+  "marketCap": { "price": 72000, "shares": 5969782550, "total": 429824343600000, "sharesNote": "보정·대체 시에만" },
+  "financials": {
+    "report": { "rceptNo": "…", "name": "분기보고서 (2025.09)", "filedDate": "20251114", "period": "202509", "fs": "CFS" },
+    "cash": 0, "shortTermDeposits": 0, "equityParent": 0, "revenue": 0, "operatingIncome": 0,
+    "netIncomeParent": 0, "incomeTax": 0, "incomeMonths": 9
+  },
+  "derived": { "netDebt": 0, "enterpriseValue": 0, "note": "…" }
 }
 ```
 
@@ -145,9 +150,11 @@ valuation_get_data(
 
 이 단계는 도구 호출이 아니라 **LLM이 반환된 JSON을 읽어 표/평균/중앙값을 계산**하는 단계입니다. 예:
 
-- Peer 베타 평균 (Weekly 5Y 조정베타) = `mean(peers[*].beta.weekly.5Y[1])`
-- D/E 비율 = `ibd.total / (marketCap.total)`
-- Peer 평균 이자부부채 비율 / P/E / EV/EBITDA 등
+- Peer 베타 평균 (Weekly 2Y 조정베타) = `mean(peers[*].beta.weekly.2Y[1])`
+- D/E 비율 = `ibd.total / marketCap.total` (금융업은 `ibd=null` → Peer 에서 제외하거나 별도 처리)
+- 순차입금·EV = `derived.netDebt`, `derived.enterpriseValue`
+- 손익 멀티플은 `financials.incomeMonths` 가 12가 아니면 누적 기간이므로 연환산 여부를 명시할 것
+- `ibd.debtLike`(상환전환우선주부채 등) 포함 여부는 사용자 판단 — 기본 합계에는 빠져 있음
 
 엑셀에서 사용 중이면 `response_format="table"` 같은 옵션이 없으므로 LLM이 직접 TSV/Markdown 표로 정리해 돌려주세요.
 
@@ -182,7 +189,7 @@ valuation_get_data(
 | Peer 5개에 대해 `compute_beta` + `dart_get_financials` + `naver_get_market_data` 각각 호출 | `valuation_get_data(stock_codes=[...5개], valuation_date="20251231")` 한 번 |
 | `get_business_content`를 5개 종목에 동시에 배치 호출 | 최종 후보 2~3개만, 한 종목씩 |
 | 분기말이면 더 빠름(캐시) — 임의 평일은 직접계산이라 다소 느릴 수 있음 | 가능하면 분기말 기준일 사용 |
-| `valuation_date="20251231"` + `year="2024"` | `year="2025"` (연도 일치) |
+| `valuation_date` 를 모른 채 오늘 날짜로 호출 | 사용자에게 평가기준일 확인 후 호출 |
 | "Peer 30개 다 뽑아서 데이터 비교" | Step 2b에서 5~10개로 좁힌 뒤 Step 4 |
 | 조서에 Peer 목록만 기록 | `snapshotDate` + `populationHash` + 배제 사유까지 기록 (재현성 증빙) |
 
@@ -202,7 +209,7 @@ valuation_get_data(
 3. `peergroup_get_population(..., include_content=true, page=1)` → `page=2, 3, ...` 순회
    → 개요·부문별 매출로 메모리·시스템·장비 구분, 삼성전자와 겹치는 메모리 반도체 Peer 5개 확정 (배제 사유 기록)
 4. (선택) 최종 후보 중 애매한 1~2개만 `get_business_content` 로 원문 심층 확인
-5. `valuation_get_data(stock_codes=["000660","042700","240810","005070","<피어5>"], valuation_date="20251231", year="2025")`
+5. `valuation_get_data(stock_codes=["000660","042700","240810","005070","<피어5>"], valuation_date="20251231")`
 6. 반환된 JSON을 파싱해서 Weekly-2Y / Monthly-5Y 조정베타 평균·중앙값, IBD 합계, 시총 합계를 표로 정리
 
 **절대 호출하지 말 것**: `dart_get_financials`, `naver_get_market_data` (valuation_get_data 가 모두 포함)
@@ -238,7 +245,7 @@ Peer Group 워크플로우를 수행하기 전 에이전트가 확인할 항목:
 - [ ] 플래그(스팩/지주사/리츠/12월외결산/관리종목) 기반 1차 배제 + 사유 기록 (Step 2a)
 - [ ] `include_content=true` 페이지 순회로 개요·부문별 매출 정성 필터링 (Step 2b)
 - [ ] 최종 Peer 5~10개 배열 구성 (배제 사유 기록)
-- [ ] `valuation_date`는 분기말, `year`는 같은 연도
+- [ ] `valuation_date`는 분기말(캐시), 재무 보고서는 `financials.report` 로 확인
 - [ ] `valuation_get_data` **한 번** 호출로 베타+IBD+NCI+세전이익+시총 수집 (Step 4)
 - [ ] 결과 집계·표 정리는 LLM이 직접 (Step 5)
 

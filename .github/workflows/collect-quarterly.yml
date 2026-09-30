@@ -1,0 +1,113 @@
+# 분기말 데이터 자동 수집 — 밸류에이션 캐시 + Peer 모집단 스냅샷
+#
+# 재무 시점 정책이 "기준일 당시 최신 공시"라서 분기말 직후 바로 확정할 수 있다.
+# DART 일일 호출 한도(키당 2만 회)에 걸리면 스크립트가 진행 파일을 남기고 종료(코드 2)하며,
+# 다음 날 같은 작업이 actions/cache 로 진행 파일을 복원해 이어서 수집한다.
+# 완성된 기준일 파일만 품질 검사를 통과하면 커밋 → Vercel 자동 배포.
+#
+# 필요 설정: 저장소 Settings → Secrets → Actions 에 OPENDART_API_KEY
+#           (선택) BLOB_READ_WRITE_TOKEN — Vercel Blob 저장소 토큰. 있으면 캐시 파일을 Blob 에도 올린다
+# 개요·부문 매출 LLM 요약(summarize-peer-snapshot)은 로컬에서 수동 실행한다(2026-09-30 결정).
+
+name: 분기 데이터 수집
+
+on:
+  schedule:
+    # 1·4·7·10월 1~12일 매일 02:30 KST (전날 17:30 UTC)
+    - cron: "30 17 1-12 1,4,7,10 *"
+  workflow_dispatch:
+    inputs:
+      dates:
+        description: "기준일 YYYYMMDD(공백 구분). 비우면 아직 없는 최근 분기말"
+        required: false
+        default: ""
+      peer_snapshot:
+        description: "Peer 모집단 스냅샷도 수집"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-quarterly
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: 진행 파일 복원(이어받기)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/valuation-cache/_shared
+            data/valuation-cache/_progress
+            data/peer-snapshot/_shared
+            data/peer-snapshot/_progress
+          key: collect-intermediates-${{ github.run_id }}
+          restore-keys: collect-intermediates-
+
+      - name: 이자부부채 엔진 회귀 테스트
+        run: npm run test:ibd
+
+      - name: 밸류에이션 캐시 수집
+        id: valuation
+        env:
+          OPENDART_API_KEY: ${{ secrets.OPENDART_API_KEY }}
+          DATES: ${{ github.event.inputs.dates }}
+        run: |
+          set +e
+          if [ -n "$DATES" ]; then npx tsx scripts/collect-valuation-cache.ts $DATES; else npx tsx scripts/collect-valuation-cache.ts --latest; fi
+          code=$?
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          # 2 = DART 한도 등으로 중단(진행 파일 저장됨) → 실패로 보지 않고 다음 날 이어서
+          if [ $code -ne 0 ] && [ $code -ne 2 ]; then exit $code; fi
+
+      - name: Peer 모집단 스냅샷 수집
+        if: steps.valuation.outputs.exit == '0' && (github.event_name == 'schedule' || github.event.inputs.peer_snapshot == 'true')
+        env:
+          OPENDART_API_KEY: ${{ secrets.OPENDART_API_KEY }}
+        run: |
+          set +e
+          LATEST=$(node -e 'const t=new Date(Date.now()+9*36e5);let y=t.getUTCFullYear(),q=Math.floor(t.getUTCMonth()/3)-1;if(q<0){q=3;y--}console.log(y+["0331","0630","0930","1231"][q])')
+          if [ ! -f "data/peer-snapshot/$LATEST.json.gz" ]; then
+            npx tsx scripts/collect-peer-snapshot.ts --date "$LATEST"
+            code=$?
+            if [ $code -ne 0 ] && [ $code -ne 2 ]; then exit $code; fi
+          fi
+
+      - name: 품질 검사
+        run: npx tsx scripts/check-valuation-cache.ts
+
+      - name: 파일 목록(manifest) 갱신
+        run: npx tsx scripts/build-data-manifest.ts
+
+      - name: Vercel Blob 업로드(설정된 경우)
+        env:
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+        run: npx tsx scripts/upload-data-blob.ts
+
+      - name: 커밋·푸시
+        run: |
+          git config user.name "kr-valuation-data bot"
+          git config user.email "actions@users.noreply.github.com"
+          # 중간 산출물(_shared·_progress·스냅샷 원본 .json)은 .gitignore 로 빠진다
+          git add -A data/valuation-cache data/peer-snapshot data/manifest.json
+          if [ -f data/blob-ledger.json ]; then git add data/blob-ledger.json; fi
+          if git diff --cached --quiet; then
+            echo "변경 없음"
+          else
+            git commit -m "data: 분기 데이터 자동 수집 $(date -u +%Y-%m-%d)"
+            git push
+          fi

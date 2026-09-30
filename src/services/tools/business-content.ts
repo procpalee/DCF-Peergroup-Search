@@ -2,36 +2,23 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { fetchBusinessContent } from "../opendart/document-parser";
 import { resolveCorpCode } from "../common/stock-code-resolver";
-import fs from "fs";
-import path from "path";
-import zlib from "zlib";
+import { readDataJson } from "../cache/data-files";
 
 const BusinessContentInputSchema = z.object({
   stock_code: z.string().describe("종목코드 6자리 (예: 005930)"),
   year: z.string().describe("대상 사업연도 (예: 2024)")
 });
 
-// 연도별 캐시 인메모리 보관 (cold start에서 1회 로딩, 이후 O(1) lookup)
-const cacheMemo = new Map<string, Record<string, string> | null>();
+// 연도별 캐시 인메모리 보관 (cold start에서 1회 로딩, 이후 O(1) lookup) — 번들 → Vercel Blob 순
+const cacheMemo = new Map<string, Promise<Record<string, string> | null>>();
 
-function loadYearCache(year: string): Record<string, string> | null {
-  if (cacheMemo.has(year)) return cacheMemo.get(year)!;
-  const baseDir = path.resolve(process.cwd(), "data/business-cache");
-  const gzPath = path.join(baseDir, `${year}.json.gz`);
-  const jsonPath = path.join(baseDir, `${year}.json`);
-  let parsed: Record<string, string> | null = null;
-  try {
-    if (fs.existsSync(gzPath)) {
-      const buf = zlib.gunzipSync(fs.readFileSync(gzPath));
-      parsed = JSON.parse(buf.toString("utf8"));
-    } else if (fs.existsSync(jsonPath)) {
-      parsed = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
-    }
-  } catch {
-    parsed = null;
+function loadYearCache(year: string): Promise<Record<string, string> | null> {
+  let p = cacheMemo.get(year);
+  if (!p) {
+    p = readDataJson<Record<string, string>>(`business-cache/${year}.json.gz`, `business-cache/${year}.json`);
+    cacheMemo.set(year, p);
   }
-  cacheMemo.set(year, parsed);
-  return parsed;
+  return p;
 }
 
 export function registerBusinessContentTool(server: McpServer): void {
@@ -61,7 +48,7 @@ Peer Group 선정 시 이 도구는 "후보군의 주요 제품/서비스가 피
     async (params: z.infer<typeof BusinessContentInputSchema>) => {
       try {
         // 1. 오프라인 캐시 우선 (gzipped JSON, cold start에서 1회만 로드)
-        const cacheData = loadYearCache(params.year);
+        const cacheData = await loadYearCache(params.year);
         if (cacheData && cacheData[params.stock_code]) {
           return { content: [{ type: "text" as const, text: cacheData[params.stock_code] }] };
         }

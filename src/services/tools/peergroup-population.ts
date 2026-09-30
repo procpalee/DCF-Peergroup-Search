@@ -108,7 +108,7 @@ export function registerPeergroupPopulationTool(server: McpServer): void {
     async (params: PeergroupPopulationInput) => {
       try {
         // 1. 스냅샷 floor 해석 (라이브 폴백 없음)
-        const snapshotDate = resolveSnapshotDate(params.valuation_date);
+        const snapshotDate = await resolveSnapshotDate(params.valuation_date);
         if (!snapshotDate) {
           return {
             content: [
@@ -116,14 +116,14 @@ export function registerPeergroupPopulationTool(server: McpServer): void {
                 type: "text" as const,
                 text: JSON.stringify({
                   error: `평가기준일 ${params.valuation_date} 이전의 스냅샷이 없습니다.`,
-                  availableSnapshotDates: getAvailableSnapshotDates(),
+                  availableSnapshotDates: await getAvailableSnapshotDates(),
                 }),
               },
             ],
             isError: true,
           };
         }
-        const snapshot = loadPeerSnapshot(snapshotDate);
+        const snapshot = await loadPeerSnapshot(snapshotDate);
         if (!snapshot) {
           return {
             content: [
@@ -131,7 +131,7 @@ export function registerPeergroupPopulationTool(server: McpServer): void {
                 type: "text" as const,
                 text: JSON.stringify({
                   error: `스냅샷 파일 로드 실패: ${snapshotDate}`,
-                  availableSnapshotDates: getAvailableSnapshotDates(),
+                  availableSnapshotDates: await getAvailableSnapshotDates(),
                 }),
               },
             ],

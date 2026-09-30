@@ -76,7 +76,8 @@ export async function fetchFinancials(
       throw new Error(`DART_ERROR: ${response.data.message} (status: ${response.data.status})`);
     }
 
-    return response.data.list ?? [];
+    // 응답 행에는 연결/별도 구분이 없다 — 실제 조회한 구분을 붙여 호출부가 판별하게 한다
+    return (response.data.list ?? []).map((i) => ({ ...i, fs_div: div }));
   };
 
   const list = await fetchDiv(fsDiv);

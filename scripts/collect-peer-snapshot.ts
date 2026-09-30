@@ -198,11 +198,19 @@ async function main() {
   const adminSet = await fetchAdministrativeIssues();
 
   // ── 1단계: 회사당 정기공시 목록 수집 (재개 지원) ──
-  const listBgn = monthsBefore(ALL_DATES[0], 15); // 목록은 항상 전체 기간으로 수집해 4개 분기 공용
-  const listEnd = ALL_DATES[ALL_DATES.length - 1];
+  // 조회 기간은 요청 기준일에 맞춘다(과거엔 2025 4개 분기로 고정 → 2026 기준일에서 2026 공시가 안 보였음).
+  // 목록 파일이 반영한 마지막 날짜(meta)가 가장 늦은 기준일보다 이르면 전 종목을 다시 받아 합친다.
+  const sortedTargets = [...targetDates].sort();
+  const listBgn = monthsBefore(sortedTargets[0], 15);
+  const listEnd = sortedTargets[sortedTargets.length - 1];
+  const listsMetaPath = path.join(SHARED_DIR, "report-lists.meta.json");
+  const listsMeta: { fetchedThrough?: string } = loadJson(listsMetaPath) ?? { fetchedThrough: "20251231" };
   const lists: Record<string, DartListDoc[]> = loadJson(LISTS_PATH) ?? {};
-  const toList = roster.filter((r) => !lists[r.corpCode]);
-  console.log(`[1단계] 공시목록: 기존 ${Object.keys(lists).length} / 미수집 ${toList.length}`);
+  const stale = (listsMeta.fetchedThrough ?? "") < listEnd;
+  const toList = roster.filter((r) => stale || !lists[r.corpCode]);
+  console.log(
+    `[1단계] 공시목록: 기존 ${Object.keys(lists).length} / ${stale ? `기준일 ${listEnd}까지 갱신` : "미수집"} ${toList.length}`,
+  );
 
   let listDone = 0;
   for (let i = 0; i < toList.length; i += BATCH_SIZE) {
@@ -210,7 +218,10 @@ async function main() {
     await Promise.all(
       batch.map(async (r) => {
         try {
-          lists[r.corpCode] = await fetchReportList(r.corpCode, listBgn, listEnd);
+          const fresh = await fetchReportList(r.corpCode, listBgn, listEnd);
+          // 이전 기간 목록과 합친다 — 과거 기준일 스냅샷 재생성에도 쓰이므로 덮어쓰지 않는다
+          const merged = new Map([...(lists[r.corpCode] ?? []), ...fresh].map((d) => [d.rcept_no, d]));
+          lists[r.corpCode] = [...merged.values()];
         } catch (e: any) {
           console.error(`[list ${r.stockCode} ${r.name}] ${e.message}`);
         }
@@ -224,6 +235,7 @@ async function main() {
     if (i + BATCH_SIZE < toList.length) await sleep(DELAY_MS);
   }
   saveJson(LISTS_PATH, lists);
+  if (stale) saveJson(listsMetaPath, { fetchedThrough: listEnd });
 
   // ── 2단계: 필요한 문서 다운로드/추출 (rcept_no 단위 중복 제거 + 후보 폴백 체인) ──
   // 각 (회사, 날짜)는 "후보 체인의 첫 성공본"을 써야 하므로, 1순위부터 순서대로
@@ -284,6 +296,13 @@ async function main() {
                 fail++;
               }
             } catch (e: any) {
+              // DART 일일 한도 초과는 문서 실패가 아니다 — FAILED 로 남기면 스냅샷이 영구히 비므로
+              // 진행분을 저장하고 중단(종료코드 2)해 다음 실행에서 이어받는다.
+              if (/020|사용한도|요청 제한/.test(e.message ?? "")) {
+                saveJson(sectionsPath, sections);
+                console.error(`[중단] DART 호출 한도: ${e.message} — 다음 실행에서 이어서 수집`);
+                process.exit(2);
+              }
               console.error(`[doc ${r.stockCode} ${cand.rcept_no}] ${e.message}`);
               sections[cand.rcept_no] = "FAILED";
               fail++;
@@ -362,6 +381,15 @@ async function main() {
       },
       companies,
     };
+    // 스냅샷은 불변이다 — 개요 누락이 평소(2025 분기 0.4~0.7%)보다 훨씬 많으면 수집 사고로 보고 확정하지 않는다
+    const nAll = Object.keys(companies).length;
+    const maxOvNull = Number(process.env.PEER_MAX_OVERVIEW_NULL ?? "0.05");
+    if (nAll === 0 || ovNull / nAll > maxOvNull) {
+      console.error(
+        `[${date}] 개요 누락 ${ovNull}/${nAll} (${((ovNull / Math.max(nAll, 1)) * 100).toFixed(1)}%) — 한도 ${(maxOvNull * 100).toFixed(0)}% 초과, 스냅샷을 쓰지 않음`,
+      );
+      process.exit(2);
+    }
     const json = JSON.stringify(snapshot);
     fs.writeFileSync(path.join(BASE_DIR, `${date}.json`), json);
     fs.writeFileSync(path.join(BASE_DIR, `${date}.json.gz`), zlib.gzipSync(json, { level: 9 }));

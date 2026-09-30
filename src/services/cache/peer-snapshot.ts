@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import zlib from "zlib";
+import { readDataJson, readManifest } from "./data-files";
 
 /**
  * 분기말 Peer 모집단 스냅샷 로더.
@@ -55,22 +55,26 @@ export interface PeerSnapshot {
 const BASE_DIR = () => path.resolve(process.cwd(), "data/peer-snapshot");
 
 // gunzip+parse 는 비용이 크므로 cold start 이후 memoize
-const snapshotMemo = new Map<string, PeerSnapshot | null>();
-let datesMemo: string[] | null = null;
+const snapshotMemo = new Map<string, Promise<PeerSnapshot | null>>();
+let datesMemo: Promise<string[]> | null = null;
 
-/** 사용 가능한 스냅샷 날짜 목록 (오름차순) */
-export function getAvailableSnapshotDates(): string[] {
-  if (datesMemo) return datesMemo;
-  const dates = new Set<string>();
-  try {
-    for (const f of fs.readdirSync(BASE_DIR())) {
-      const m = f.match(/^(\d{8})\.json(\.gz)?$/);
-      if (m) dates.add(m[1]);
-    }
-  } catch {
-    // 디렉토리 없음 → 빈 목록
+/** 사용 가능한 스냅샷 날짜 목록 (오름차순) — 번들 파일 ∪ data/manifest.json(Blob 에만 있는 날짜) */
+export function getAvailableSnapshotDates(): Promise<string[]> {
+  if (!datesMemo) {
+    datesMemo = (async () => {
+      const dates = new Set<string>();
+      try {
+        for (const f of fs.readdirSync(BASE_DIR())) {
+          const m = f.match(/^(\d{8})\.json(\.gz)?$/);
+          if (m) dates.add(m[1]);
+        }
+      } catch {
+        // 디렉토리 없음 → 빈 목록
+      }
+      for (const d of (await readManifest())?.peerSnapshot ?? []) dates.add(d);
+      return [...dates].sort();
+    })();
   }
-  datesMemo = [...dates].sort();
   return datesMemo;
 }
 
@@ -79,31 +83,21 @@ export function getAvailableSnapshotDates(): string[] {
  * 스냅샷은 미래 방향으로만 추가되고 과거 파일은 불변이므로,
  * 과거 valuation_date 에 대한 floor 결과는 영원히 동일 → 결정론 성립.
  */
-export function resolveSnapshotDate(valuationDate: string): string | null {
+export async function resolveSnapshotDate(valuationDate: string): Promise<string | null> {
   let best: string | null = null;
-  for (const d of getAvailableSnapshotDates()) {
+  for (const d of await getAvailableSnapshotDates()) {
     if (d <= valuationDate) best = d;
     else break;
   }
   return best;
 }
 
-/** 스냅샷 로드 (gz 우선, 없으면 raw json). 파일 없으면 null. */
-export function loadPeerSnapshot(snapshotDate: string): PeerSnapshot | null {
-  if (snapshotMemo.has(snapshotDate)) return snapshotMemo.get(snapshotDate)!;
-
-  const gzPath = path.join(BASE_DIR(), `${snapshotDate}.json.gz`);
-  const jsonPath = path.join(BASE_DIR(), `${snapshotDate}.json`);
-  let parsed: PeerSnapshot | null = null;
-  try {
-    if (fs.existsSync(gzPath)) {
-      parsed = JSON.parse(zlib.gunzipSync(fs.readFileSync(gzPath)).toString("utf8"));
-    } else if (fs.existsSync(jsonPath)) {
-      parsed = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
-    }
-  } catch {
-    parsed = null;
+/** 스냅샷 로드 (gz 우선, 없으면 raw json; 번들 → Blob 순). 파일 없으면 null. */
+export function loadPeerSnapshot(snapshotDate: string): Promise<PeerSnapshot | null> {
+  let p = snapshotMemo.get(snapshotDate);
+  if (!p) {
+    p = readDataJson<PeerSnapshot>(`peer-snapshot/${snapshotDate}.json.gz`, `peer-snapshot/${snapshotDate}.json`);
+    snapshotMemo.set(snapshotDate, p);
   }
-  snapshotMemo.set(snapshotDate, parsed);
-  return parsed;
+  return p;
 }

@@ -2,14 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { computeBetaGridBatch } from "../beta-calc";
 import { resolveCorpCode, getCompanyInfo } from "../common/stock-code-resolver";
-import { fetchFinancials, fetchStockQuantity, extractSharesInfo, extractNciAndPretax, extractDebtSummary } from "../opendart/client";
-import { REPORT_CODE } from "../opendart/constants";
-import { extractDebtFromXbrl } from "../opendart/xbrl-parser";
-import { fetchMarketData } from "../naver/client";
+import { fetchMarketData, fetchHistoricalPrices } from "../naver/client";
 import { handleApiError } from "../utils/error-handler";
 import { getCachedValuation } from "../cache/valuation-cache";
 import { getIndustryName } from "../opendart/ksic-codes";
-import type { DebtSummary } from "../opendart/types";
+import { sanitizeShares } from "../opendart/ibd-engine";
+import { resolveAsOfFinancials, type FinResult } from "../valuation/asof-financials";
 import type { StockBetaResult } from "../kicpa/types";
 
 // ─── 스키마 ───
@@ -24,7 +22,7 @@ const ValuationDataInputSchema = z.object({
   valuation_date: z.string().regex(/^\d{8}$/, "평가기준일은 YYYYMMDD 형식이어야 합니다")
     .describe("⚠️[필수] 평가기준일 YYYYMMDD. 모를 경우 임의의 오늘 날짜를 넣지 말고 반드시 사용자에게 확인하세요. 베타 조회일 및 사업연도 결정에 사용"),
   year: z.string().regex(/^\d{4}$/).optional()
-    .describe("재무제표 사업연도 YYYY. ⚠️주의: 반드시 평가기준일(valuation_date)과 동일한 연도를 입력해야 합니다! (예: 평가기준일이 20251231이면 무조건 2025 입력). 입력하지 않으면 평가기준일의 연도를 자동으로 산정합니다."),
+    .describe("(사용하지 않음 — 하위호환용) 재무 보고서는 평가기준일 당시 공시된 최신 정기보고서로 자동 선택됩니다."),
   api_key: z.string().optional()
     .describe("OpenDART API 키 (미입력 시 서버 환경변수 사용)"),
 });
@@ -42,19 +40,29 @@ interface CompactIBD {
   current: [string, number][];
   nonCurrent: [string, number][];
   total: number;
+  /** 합계에서 뺀 부채성 항목(상환전환우선주부채·신종자본증권 등) */
+  debtLike?: [string, number][];
+  /** 산정 경고(구역 합계 불일치, 주석 보충 등) */
+  checks?: string[];
 }
 
 export interface CompactResult {
   code: string;
   name: string | null;
   industry: { code: string; name: string | null } | null;
-  year: string;
+  /** 재무에 쓴 보고서의 사업연도 */
+  year: string | null;
   valuationDate: string;
   beta: CompactBeta;
   ibd: CompactIBD | null;
+  /** 금융업 등 이자부부채를 산정하지 않은 사유 */
+  ibdExcluded?: string;
   nci: number | null;
   pretaxIncome: number | null;
-  marketCap: { price: number | null; shares: number | null; total: number | null };
+  marketCap: { price: number | null; shares: number | null; total: number | null; sharesNote?: string };
+  /** 사용 보고서와 현금·자본·실적(손익은 incomeMonths 개월 누적) */
+  financials?: ({ report: { rceptNo: string; name: string; filedDate: string; period: string; fs: string | null } } & Record<string, unknown>) | null;
+  derived?: { netDebt: number; enterpriseValue: number | null; note: string };
 }
 
 // ─── 도구 등록 ───
@@ -64,35 +72,30 @@ export function registerValuationDataTool(server: McpServer): void {
     "valuation_get_data",
     {
       title: "DCF 밸류에이션 데이터 조회",
-      description: `DCF 밸류에이션에 필요한 핵심 데이터를 조회합니다.
-베타 + OpenDART(XBRL/재무/주식수) + 네이버금융(종가)을 병렬 호출합니다.
-최대 10개 종목을 한번에 배치 조회할 수 있습니다.
+      description: `DCF 밸류에이션에 필요한 핵심 데이터를 조회합니다. 최대 10개 종목을 한 번에 배치 조회합니다.
 
-[베타 출처] 평가기준일이 캐시된 분기말(예: 2025-03/06/09/12 말)이면 KICPA 공식 캐시값을 사용하고,
-그 외 임의 영업일이면 네이버 주가+KOSPI 회귀로 직접 계산(compute_beta 로직)합니다.
+[시점 규칙]
+- 재무(이자부부채·비지배지분·현금·자본·실적·주식수): 평가기준일 당시 이미 공시된 최신 정기보고서
+  (예: 2025-03-31 → 2024 사업보고서, 2025-06-30 → 2025 1분기보고서). 사용 보고서는 financials.report 에 표시.
+- 주가: 평가기준일(이전 최근 거래일) 종가. 베타: 기준일까지의 네이버 주가 + KOSPI 회귀.
+- 분기말은 사전 수집 캐시로 즉시 응답, 그 외 날짜는 같은 규칙으로 실시간 계산.
 
 [⚠️ 필수 입력 — 둘 다 없으면 호출이 거부됩니다]
 1. 종목코드 (stock_codes 또는 stock_code). 회사명만 있으면 먼저 search_stock 으로 종목코드를 조회하세요.
-2. 평가기준일 (valuation_date, YYYYMMDD).
-→ 두 값을 모르면 추측하지 말고 반드시 사용자에게 먼저 확인한 뒤 호출하세요.
-
-[⚠️ AI를 위한 엄격한 파라미터 규칙]
-- year 파라미터는 특별한 지시가 없는 한 무조건 valuation_date 의 연도와 일치시켜야 합니다. (관습적으로 작년 재무제표를 조회하려 하지 마세요!)
-- valuation_date 는 필수입니다. 모를 경우 임의의 오늘 날짜를 넣지 말고 사용자에게 확인하세요.
+2. 평가기준일 (valuation_date, YYYYMMDD). 모르면 추측하지 말고 사용자에게 확인하세요.
 
 [반환 데이터 — compact JSON]
-- beta: Weekly-2Y, Monthly-5Y — 값은 [실질베타, 조정베타, 포인트수] 배열
-- ibd: 유동/비유동 세부계정 — 값은 [계정명, 금액] 튜플
+- beta: Weekly-2Y, Monthly-5Y — [실질베타, 조정베타, 포인트수]
+- ibd: 이자부부채 유동/비유동 [계정명, 금액] — 재무상태표 본문 기준, 차입금이 '금융부채'로 묶인 회사는 주석 금액으로 보충.
+  debtLike(상환전환우선주부채·신종자본증권 등)는 합계에서 제외해 따로 표시, checks 는 산정 경고.
+  금융업(은행·보험·증권·금융지주)은 ibd=null 이고 ibdExcluded 에 사유.
 - nci: 비지배지분, pretaxIncome: 세전이익
-- marketCap: { price, shares(유통주식수), total }
-
-[파라미터]
-- stock_codes: 종목코드 6자리 (단일 문자열 또는 최대 10개 배열) — 필수
-- valuation_date: 평가기준일 YYYYMMDD — 필수
-- year: 재무제표 사업연도 (기본: 평가기준일 연도)
+- marketCap: { price, shares(유통주식수), total, sharesNote(주식수 보정·대체 설명) }
+- financials: 사용 보고서 + cash·shortTermDeposits·equityParent·revenue·operatingIncome·netIncomeParent·incomeTax (손익은 incomeMonths 개월 누적)
+- derived: netDebt(이자부부채−현금−단기금융상품), enterpriseValue(시가총액+순차입금+비지배지분)
 
 [Peer 워크플로우 Step 4]
-Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호출하세요. 캐시된 분기말은 즉시 응답하고, 캐시되지 않은 분기말/영업일은 베타를 네이버+KOSPI 회귀로 직접 계산해 반환합니다. 이 도구 하나가 베타(Weekly-2Y, Monthly-5Y) + 이자부부채(유동/비유동) + 비지배지분 + 세전이익 + 시가총액(price/shares/total) 을 모두 반환하므로, 같은 용도로 dart_get_financials / naver_get_market_data 를 따로 호출하지 마세요. 상세는 docs/PEER_GROUP_WORKFLOW.md 참조.`,
+Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호출하세요. 이 도구 하나가 베타·이자부부채·비지배지분·세전이익·시가총액·현금·실적을 모두 반환하므로 같은 용도로 dart_get_financials / naver_get_market_data 를 따로 호출하지 마세요. 상세는 docs/PEER_GROUP_WORKFLOW.md 참조.`,
       inputSchema: ValuationDataInputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
@@ -109,7 +112,6 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
         };
       }
       const valuationDate = params.valuation_date;
-      const year = params.year ?? valuationDate.slice(0, 4);
       const codes = Array.isArray(rawCodes) ? rawCodes : [rawCodes];
       const apiKey = params.api_key;
 
@@ -119,7 +121,7 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
         const uncachedCodes: string[] = [];
 
         for (const code of codes) {
-          const hit = getCachedValuation(code, valuationDate);
+          const hit = await getCachedValuation(code, valuationDate);
           if (hit) {
             cached.push(hit as CompactResult);
           } else {
@@ -135,7 +137,7 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
           const { weeklyMap, monthlyMap } = await computeBetaGridBatch(uncachedCodes, valuationDate);
 
           // 2. 미스 종목만 재무/주식수/시장/XBRL — 병렬
-          liveResults = await Promise.all(uncachedCodes.map((code) => processCompany(code, year, apiKey, weeklyMap, monthlyMap)));
+          liveResults = await Promise.all(uncachedCodes.map((code) => processCompany(code, valuationDate, apiKey, weeklyMap, monthlyMap)));
         }
 
         // 3. 캐시 + 라이브 결과 병합 (요청 순서 유지)
@@ -143,7 +145,7 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
         for (const r of cached) resultMap.set(r.code, r);
         for (const r of liveResults) resultMap.set(r.code, r);
         // 베타는 Weekly-2Y, Monthly-5Y 두 가지만 노출 (기존 캐시 파일은 그대로 두되 출력만 축소)
-        const results = codes.map((code) => pickBeta(resultMap.get(code)!));
+        const results = codes.map((code) => finalize(resultMap.get(code)!));
 
         // 4. 응답: 단일이면 객체, 다중이면 배열
         const output = results.length === 1 ? results[0] : results;
@@ -155,118 +157,140 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
   );
 }
 
-// ─── 종목별 처리 ───
+// ─── 종목별 처리 (비캐시 기준일) ───
 
+/**
+ * 캐시에 없는 기준일 — 수집 스크립트와 같은 규칙으로 계산한다.
+ *  재무: 기준일 당시 공시된 최신 정기보고서(asof-financials) — 이자부부채 엔진 v2
+ *  주가: 기준일(이전 최근 거래일) 종가 — 과거에는 오늘 현재가를 써서 시가총액이 틀렸다
+ *  주식수: DART 유통주식수를 네이버 현재 상장주식수와 대조해 단위 오류 보정
+ */
 async function processCompany(
   code: string,
-  year: string,
+  valuationDate: string,
   apiKey: string | undefined,
   weeklyMap: Map<string, StockBetaResult>,
   monthlyMap: Map<string, StockBetaResult>,
 ): Promise<CompactResult> {
-  const valuationDate = formatDate(new Date());
-
-  // 병렬: corpCode resolve → 재무/주식수/시장/기업정보
   const corpCode = await resolveCorpCode(code);
+  const start = shiftDays(valuationDate, -14);
 
-  const [financialResult, stockQtyResult, marketResult, companyResult] = await Promise.allSettled([
-    fetchFinancials(corpCode, year, REPORT_CODE.annual, "CFS", apiKey),
-    fetchStockQuantity(corpCode, year, REPORT_CODE.annual, apiKey),
-    fetchMarketData(code),
+  const [companyResult, pricesResult, marketResult] = await Promise.allSettled([
     getCompanyInfo(code, apiKey),
+    fetchHistoricalPrices(code, start, valuationDate),
+    fetchMarketData(code),
   ]);
+  const info = companyResult.status === "fulfilled" ? companyResult.value : null;
+  const industryCode = info?.induty_code || null;
 
-  // 기업명 + 업종
-  const name = companyResult.status === "fulfilled" ? companyResult.value.corp_name : null;
-  const industryCode = companyResult.status === "fulfilled" ? companyResult.value.induty_code : null;
-  const industry = industryCode
-    ? { code: industryCode, name: getIndustryName(industryCode) }
-    : null;
-
-  // 베타 → compact [raw, adjusted, dataPoints]
-  const beta: CompactBeta = {
-    weekly: compactBetas(weeklyMap.get(code)),
-    monthly: compactBetas(monthlyMap.get(code)),
-  };
-
-  // 주식수
-  const shares = stockQtyResult.status === "fulfilled"
-    ? extractSharesInfo(stockQtyResult.value, year, REPORT_CODE.annual)
-    : null;
-
-  // 종가 + 시가총액
-  const price = marketResult.status === "fulfilled" ? (marketResult.value.price ?? null) : null;
-  const mcapTotal = shares && price ? shares.outstanding * price : null;
-
-  // IBD (XBRL 우선 → Tier1/2 폴백) + NCI/세전이익
-  let ibd: CompactIBD | null = null;
-  let nci: number | null = null;
-  let pretaxIncome: number | null = null;
-
-  if (financialResult.status === "fulfilled") {
-    const items = financialResult.value;
-    const nciPretax = extractNciAndPretax(items);
-    nci = nciPretax.nonControllingInterest;
-    pretaxIncome = nciPretax.pretaxIncome;
-
-    const rceptNo = items[0]?.rcept_no;
-    let debt: DebtSummary | null = null;
-
-    if (rceptNo) {
-      const xbrlDebt = await extractDebtFromXbrl(rceptNo, year, apiKey);
-      if (xbrlDebt) {
-        debt = { ...xbrlDebt, nonControllingInterest: nci, pretaxIncome };
-      }
-    }
-
-    if (!debt) {
-      const fallback = extractDebtSummary(items);
-      if (fallback.interestBearingDebt > 0) debt = fallback;
-    }
-
-    if (debt) {
-      ibd = {
-        current: debt.current.items.map((i) => [i.account, i.amount]),
-        nonCurrent: debt.nonCurrent.items.map((i) => [i.account, i.amount]),
-        total: debt.interestBearingDebt,
-      };
-    }
+  let fin: FinResult | null = null;
+  try {
+    fin = await resolveAsOfFinancials(
+      { corpCode, industryCode, accMonth: info?.acc_mt || "12" },
+      valuationDate,
+      apiKey,
+    );
+  } catch {
+    fin = null;
   }
 
+  // 기준일 이하 마지막 거래일 종가
+  const closes = pricesResult.status === "fulfilled"
+    ? pricesResult.value.filter((p) => p.date <= valuationDate)
+    : [];
+  const price = closes.length ? closes[closes.length - 1].close : null;
+
+  // 참조 상장주식수 = 네이버 현재 시총 ÷ 현재가 (단위 오류 판별용)
+  let ref: number | null = null;
+  if (marketResult.status === "fulfilled") {
+    const cap = parseKrw(marketResult.value.marketCap);
+    ref = cap && marketResult.value.price ? Math.round(cap / marketResult.value.price) : null;
+  }
+  const sh = fin?.sharesDart
+    ? sanitizeShares(fin.sharesDart, ref)
+    : ref
+      ? { shares: ref, note: "DART 주식수 없음 — 네이버 현재 상장주식수(기준일과 다를 수 있음)" }
+      : { shares: null, note: "주식수 없음" };
+  const sharesNote = [fin?.sharesSource ? `주식수는 ${fin.sharesSource} 기준(해당 보고서 미기재)` : null, sh.note]
+    .filter(Boolean)
+    .join("; ");
+
+  const fu = fin?.fundamentals ?? null;
   return {
     code,
-    name,
-    industry,
-    year,
+    name: info?.corp_name ?? null,
+    industry: industryCode ? { code: industryCode, name: getIndustryName(industryCode) } : null,
+    year: fin?.report.bsnsYear ?? null,
     valuationDate,
-    beta,
-    ibd,
-    nci,
-    pretaxIncome,
-    marketCap: { price, shares: shares?.outstanding ?? null, total: mcapTotal },
+    beta: { weekly: compactBetas(weeklyMap.get(code)), monthly: compactBetas(monthlyMap.get(code)) },
+    ibd: fin?.ibd ?? null,
+    ...(fin?.ibdExcluded ? { ibdExcluded: fin.ibdExcluded } : {}),
+    nci: fu?.nci ?? null,
+    pretaxIncome: fu?.pretaxIncome ?? null,
+    marketCap: {
+      price,
+      shares: sh.shares,
+      total: price && sh.shares ? price * sh.shares : null,
+      ...(sharesNote ? { sharesNote } : {}),
+    },
+    financials: fin
+      ? {
+          report: {
+            rceptNo: fin.report.rceptNoReturned ?? fin.report.rceptNo,
+            name: fin.report.reportName,
+            filedDate: fin.report.rceptDate,
+            period: fin.report.period,
+            fs: fin.report.fsDiv,
+          },
+          ...(fu ?? {}),
+          ...(fin.error ? { error: fin.error } : {}),
+        }
+      : null,
   };
 }
 
 // ─── 유틸리티 ───
 
-/** 베타 출력을 Weekly-2Y, Monthly-5Y 두 가지로만 축소 (기존 캐시 파일은 보존) */
-function pickBeta(r: CompactResult): CompactResult {
+/** 베타 출력을 Weekly-2Y, Monthly-5Y 두 가지로만 축소하고, 순차입금·EV 보조값을 붙인다 */
+function finalize(r: CompactResult): CompactResult {
   const w = r.beta.weekly?.["2Y"];
   const m = r.beta.monthly?.["5Y"];
+  const cash = (r.financials?.cash ?? null) as number | null;
+  const std = (r.financials?.shortTermDeposits ?? 0) as number;
+  const netDebt = r.ibd && cash != null ? r.ibd.total - cash - (std || 0) : null;
   return {
     ...r,
     beta: {
       weekly: w ? { "2Y": w } : null,
       monthly: m ? { "5Y": m } : null,
     },
+    ...(netDebt != null
+      ? {
+          derived: {
+            netDebt,
+            enterpriseValue: r.marketCap.total != null ? r.marketCap.total + netDebt + (r.nci ?? 0) : null,
+            note: "순차입금 = 이자부부채 − 현금및현금성자산 − 단기금융상품, EV = 보통주 시가총액 + 순차입금 + 비지배지분",
+          },
+        }
+      : {}),
   };
 }
 
-function formatDate(date: Date): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  return `${y}${m}${d}`;
+function shiftDays(yyyymmdd: string, days: number): string {
+  const d = new Date(`${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10).replace(/-/g, "");
+}
+
+/** 네이버 "1,579조 9,568억" → 원 */
+function parseKrw(s: string | null | undefined): number | null {
+  if (!s) return null;
+  let total = 0;
+  const jo = s.match(/([\d,]+)\s*조/);
+  const eok = s.match(/([\d,]+)\s*억/);
+  if (jo) total += Number(jo[1].replace(/,/g, "")) * 1e12;
+  if (eok) total += Number(eok[1].replace(/,/g, "")) * 1e8;
+  return total > 0 ? total : null;
 }
 
 /** BetaValues → compact [raw, adjusted, dataPoints] 배열로 변환 */
