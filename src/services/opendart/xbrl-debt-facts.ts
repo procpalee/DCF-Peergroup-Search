@@ -42,7 +42,17 @@ const WANTED = new Set([
   // 유동/비유동 구분 태그가 없는 회사의 대체 총액(LG디스플레이 2025 등)
   "LoansReceived",
   "BondsIssued",
+  // 표준 요소가 없을 때만 쓰는 대체 요소(셀트리온 장기차입금, HD한국조선해양 기타차입금 등)
+  "LongtermBorrowings",
+  "OtherCurrentBorrowingsAndCurrentPortionOfOtherNoncurrentBorrowings",
+  "NoncurrentPortionOfOtherNoncurrentBorrowings",
+  "OtherBorrowings",
+  "LiabilitiesArisingFromFinancingActivities",
 ]);
+
+/** DART '공시금액' 열 — 이 축 하나만 더 붙은 문맥은 의미상 차원 없는 값과 같다 */
+export const REPORTED_AMOUNT_SUFFIX =
+  "_ifrs-full_CarryingAmountAccumulatedDepreciationAmortisationAndImpairmentAndGrossCarryingAmountAxis_dart_ReportedAmountMember";
 
 /**
  * xbrl 문자열에서 scope(연결/별도)의 당기말 "차원 없는" 사실만 모은다.
@@ -70,20 +80,37 @@ export function parseXbrlInstantFacts(
   scope: XbrlScope,
   keep: (element: string, prefix: string) => boolean = (el) => DEBTISH_ELEMENT.test(el),
 ): XbrlFacts {
+  return parseXbrlInstantFactSets(xml, year, scope, keep).facts;
+}
+
+/**
+ * 차원 없는 문맥(facts)과 '공시금액' 문맥(factsRpt)을 따로 모은다.
+ * 셀트리온·코스맥스·기아처럼 차입금·리스를 공시금액 문맥에만 태깅한 회사가 있다(2026-10-01 블라인드 검증).
+ * 두 값을 max 로 섞지 않는다 — 요약(summarizeXbrlDebt)에서 차원 없는 값을 우선하고 없을 때만 공시금액을 쓴다.
+ */
+export function parseXbrlInstantFactSets(
+  xml: string,
+  year: string | null,
+  scope: XbrlScope,
+  keep: (element: string, prefix: string) => boolean = (el) => DEBTISH_ELEMENT.test(el),
+): { facts: XbrlFacts; factsRpt: XbrlFacts } {
   const suffix = `_ifrs-full_ConsolidatedAndSeparateFinancialStatementsAxis_ifrs-full_${scope}`;
   const ctxRe = new RegExp(`context id="(CFY(\\d{4})e[A-Za-z0-9]*${suffix})"`, "g");
   const candidates = [...xml.matchAll(ctxRe)].map((m) => ({ id: m[1], y: m[2] }));
   const chosen = candidates.find((c) => c.y === year) ?? candidates[0];
-  if (!chosen) return {};
+  if (!chosen) return { facts: {}, factsRpt: {} };
+  const rptId = chosen.id + REPORTED_AMOUNT_SUFFIX;
   const facts: XbrlFacts = {};
+  const factsRpt: XbrlFacts = {};
   const re = /<([A-Za-z][\w-]*):([A-Za-z]\w*) [^>]*contextRef="([^"]+)"[^>]*>(-?\d+)</g;
   for (const m of xml.matchAll(re)) {
     const [, prefix, el, ctx, v] = m;
-    if (ctx !== chosen.id || !keep(el, prefix)) continue;
+    const target = ctx === chosen.id ? facts : ctx === rptId ? factsRpt : null;
+    if (!target || !keep(el, prefix)) continue;
     const key = prefix === "ifrs-full" ? el : `${prefix}:${el}`;
-    facts[key] = Math.max(facts[key] ?? -Infinity, Number(v));
+    target[key] = Math.max(target[key] ?? -Infinity, Number(v));
   }
-  return facts;
+  return { facts, factsRpt };
 }
 
 /**
@@ -151,25 +178,41 @@ export interface XbrlDebtSummary {
   borrowings: number | null;
   loansReceived: number | null;
   bondsIssued: number | null;
+  /** 재무활동에서 생기는 부채 조정표의 기말 합계(차입·사채·리스 등) — 완전성 점검용 */
+  laffa: number | null;
+  /** 유동/비유동 값에 대체 요소(장기차입금·기타차입금·dart 사채)를 썼으면 true */
+  usedFallback: boolean;
 }
 
-const sumDefined = (...xs: (number | undefined)[]) => {
+const sumDefined = (...xs: (number | null | undefined)[]) => {
   const d = xs.filter((x): x is number => typeof x === "number");
   return d.length ? d.reduce((a, b) => a + b, 0) : null;
 };
 
-export function summarizeXbrlDebt(f: XbrlFacts): XbrlDebtSummary {
-  const current =
-    f.CurrentBorrowingsAndCurrentPortionOfNoncurrentBorrowings ??
-    sumDefined(
-      f.CurrentLoansReceivedAndCurrentPortionOfNoncurrentLoansReceived ??
-        sumDefined(f.ShorttermBorrowings, f.CurrentPortionOfLongtermBorrowings) ??
-        undefined,
-      f.CurrentBondsIssuedAndCurrentPortionOfNoncurrentBondsIssued,
-    );
-  const nonCurrent =
-    f.NoncurrentPortionOfNoncurrentBorrowings ??
-    sumDefined(f.NoncurrentPortionOfNoncurrentLoansReceived, f.NoncurrentPortionOfNoncurrentBondsIssued);
+/**
+ * '공시금액' 문맥(rpt)을 우선하고, 없는 요소만 차원 없는 사실(f0)로 채운 뒤 요약한다.
+ * 규칙 — 포괄 요소를 우선하고, 없을 때만 세부 요소를 합산한다(포함관계 이중계상 방지).
+ * 표준 요소가 없을 때만 대체 요소를 쓴다(장기차입금·기타차입금·dart 유동성사채/사채).
+ */
+export function summarizeXbrlDebt(f0: XbrlFacts, rpt: XbrlFacts = {}): XbrlDebtSummary {
+  // '공시금액' 문맥이 재무제표에 표시된 값 — 있으면 그것을 쓰고, 없는 요소만 차원 없는 값으로(삼성SDI 리스 등, 2026-10-01 대조)
+  const f: XbrlFacts = { ...f0, ...rpt };
+  const abs = (v: number | undefined) => (v == null ? undefined : Math.abs(v));
+  let usedFallback = false;
+  const fb = (v: number | null | undefined, alt: number | null | undefined): number | undefined => {
+    if (v != null) return v;
+    if (alt != null) usedFallback = true;
+    return alt ?? undefined;
+  };
+  const curLoansStd =
+    f.CurrentLoansReceivedAndCurrentPortionOfNoncurrentLoansReceived ??
+    sumDefined(f.ShorttermBorrowings, f.CurrentPortionOfLongtermBorrowings);
+  const curLoans = fb(curLoansStd, f.OtherCurrentBorrowingsAndCurrentPortionOfOtherNoncurrentBorrowings);
+  const curBonds = fb(f.CurrentBondsIssuedAndCurrentPortionOfNoncurrentBondsIssued, abs(f["dart:CurrentPortionOfBonds"]));
+  const ncLoans = fb(fb(f.NoncurrentPortionOfNoncurrentLoansReceived, f.NoncurrentPortionOfOtherNoncurrentBorrowings), f.LongtermBorrowings);
+  const ncBonds = fb(f.NoncurrentPortionOfNoncurrentBondsIssued, abs(f["dart:NonCurrentBonds"] ?? f["dart:Bonds"]));
+  const current = f.CurrentBorrowingsAndCurrentPortionOfNoncurrentBorrowings ?? sumDefined(curLoans, curBonds);
+  const nonCurrent = f.NoncurrentPortionOfNoncurrentBorrowings ?? sumDefined(ncLoans, ncBonds);
   let reconciles: boolean | null = null;
   if (f.Borrowings && current != null && nonCurrent != null) {
     reconciles = Math.abs(current + nonCurrent - f.Borrowings) / f.Borrowings < 0.01;
@@ -179,18 +222,18 @@ export function summarizeXbrlDebt(f: XbrlFacts): XbrlDebtSummary {
     nonCurrent,
     leaseCurrent: f.CurrentLeaseLiabilities ?? null,
     leaseNonCurrent: f.NoncurrentLeaseLiabilities ?? null,
-    total: f.Borrowings ?? sumDefined(f.LoansReceived, f.BondsIssued),
-    totalPartial: f.Borrowings == null && (f.LoansReceived != null || f.BondsIssued != null),
+    total: f.Borrowings ?? f.OtherBorrowings ?? sumDefined(f.LoansReceived, f.BondsIssued),
+    totalPartial: f.Borrowings == null && (f.OtherBorrowings != null || f.LoansReceived != null || f.BondsIssued != null),
     leaseTotal: f.LeaseLiabilities ?? null,
     reconciles,
-    currentLoans:
-      f.CurrentLoansReceivedAndCurrentPortionOfNoncurrentLoansReceived ??
-      sumDefined(f.ShorttermBorrowings, f.CurrentPortionOfLongtermBorrowings),
-    currentBonds: f.CurrentBondsIssuedAndCurrentPortionOfNoncurrentBondsIssued ?? null,
-    nonCurrentLoans: f.NoncurrentPortionOfNoncurrentLoansReceived ?? null,
-    nonCurrentBonds: f.NoncurrentPortionOfNoncurrentBondsIssued ?? null,
+    currentLoans: curLoans ?? null,
+    currentBonds: curBonds ?? null,
+    nonCurrentLoans: ncLoans ?? null,
+    nonCurrentBonds: ncBonds ?? null,
     borrowings: f.Borrowings ?? null,
     loansReceived: f.LoansReceived ?? null,
     bondsIssued: f.BondsIssued ?? null,
+    laffa: f.LiabilitiesArisingFromFinancingActivities ?? null,
+    usedFallback,
   };
 }

@@ -10,9 +10,9 @@
  */
 import fs from "fs";
 import path from "path";
-import { applyXbrlSupplement, computeIbdV2, toCompactIbd, guessCategoryByName, normalizeCompactIbd } from "../src/services/opendart/ibd-engine";
+import { applyXbrlSupplement, computeIbdV2, toCompactIbd, guessCategoryByName, normalizeCompactIbd, needsXbrlNotes } from "../src/services/opendart/ibd-engine";
 import { computeIbdFromRaw, type RawReport } from "../src/services/valuation/asof-financials";
-import { summarizeXbrlDebt, type XbrlFacts } from "../src/services/opendart/xbrl-debt-facts";
+import { summarizeXbrlDebt, parseXbrlInstantFactSets, REPORTED_AMOUNT_SUFFIX, type XbrlFacts } from "../src/services/opendart/xbrl-debt-facts";
 import type { DartFinancialItem } from "../src/services/opendart/types";
 
 const ROOT = path.resolve(__dirname, "..");
@@ -185,12 +185,11 @@ if (!dump && fs.existsSync(GOLD))
       name: string;
       industryCode: string;
       items: DartFinancialItem[];
-      xbrl: { facts: XbrlFacts } | null;
+      xbrl: { facts: XbrlFacts; factsRpt?: XbrlFacts } | null;
       expected: { excluded: boolean; total: number; currentTotal: number; nonCurrentTotal: number; lease: number };
     };
     const r = computeIbdV2(g.items, { industryCode: g.industryCode });
-    const agg = r.meta.aggregatedFinancialLiabilities;
-    if ((agg.current || agg.nonCurrent) && g.xbrl) applyXbrlSupplement(r, summarizeXbrlDebt(g.xbrl.facts));
+    if (needsXbrlNotes(r) && g.xbrl) applyXbrlSupplement(r, summarizeXbrlDebt(g.xbrl.facts, g.xbrl.factsRpt));
     const sum = (a: { amount: number }[]) => a.reduce((s, x) => s + x.amount, 0);
     const lease = [...r.current, ...r.nonCurrent, ...r.unclassified].filter((l) => l.category === "lease").reduce((s, l) => s + l.amount, 0);
     const errs: string[] = [];
@@ -536,6 +535,25 @@ synthetic.push(
       const r = run([["유동성상환전환우선주파생상품부채", NS, "100"], ["전환권부채", NS, "100"], ["신주인수권부채", "dart_BondsWithWarrant", "100"]], [], [300, 0]);
       const t = r.debtLike.map((d) => d.type);
       return expect(JSON.stringify(t) === JSON.stringify(["convDerivative", "convDerivative"]) && cats(r).convertible === 100, `${t} ${JSON.stringify(cats(r))}`);
+    },
+  },
+  {
+    name: "XBRL 파서 — '공시금액' 문맥 우선, 없는 요소는 차원 없는 값, 다른 축은 제외",
+    run: () => {
+      const scope = "_ifrs-full_ConsolidatedAndSeparateFinancialStatementsAxis_ifrs-full_ConsolidatedMember";
+      const c0 = `CFY2026eTQA${scope}`;
+      const rpt = c0 + REPORTED_AMOUNT_SUFFIX;
+      const other = c0 + "_ifrs-full_BorrowingsByNameAxis_entity1_XMember";
+      const xml = [
+        `<xbrli:context id="${c0}"></xbrli:context><xbrli:context id="${rpt}"></xbrli:context><xbrli:context id="${other}"></xbrli:context>`,
+        `<ifrs-full:Borrowings contextRef="${c0}" unitRef="KRW" decimals="-6">1000</ifrs-full:Borrowings>`,
+        `<ifrs-full:Borrowings contextRef="${rpt}" unitRef="KRW" decimals="-6">999</ifrs-full:Borrowings>`,
+        `<ifrs-full:ShorttermBorrowings contextRef="${rpt}" unitRef="KRW" decimals="-6">600</ifrs-full:ShorttermBorrowings>`,
+        `<ifrs-full:ShorttermBorrowings contextRef="${other}" unitRef="KRW" decimals="-6">50</ifrs-full:ShorttermBorrowings>`,
+      ].join("\n");
+      const sets = parseXbrlInstantFactSets(xml, "2026", "ConsolidatedMember");
+      const sum = summarizeXbrlDebt(sets.facts, sets.factsRpt);
+      return expect(sets.facts.Borrowings === 1000 && sets.factsRpt.ShorttermBorrowings === 600 && sum.total === 999 && sum.currentLoans === 600, JSON.stringify(sets));
     },
   },
   {

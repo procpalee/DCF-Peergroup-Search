@@ -13,7 +13,9 @@
  *  7. 본문이 '금융부채'로 묶이면 주석 XBRL 로 보충하되, 본문에 없는 금액만, 구역 부채 소계 안에서만 더한다.
  *  8. 빠졌을 가능성이 있으면 completeness='partial' 과 사유를 남긴다(조용한 0·조용한 과소 금지).
  *
- * v2.2(2026-09-30 오프라인 점검) · v2.2.1(같은 날 구현 독립 검증 반영 — W07~W31, S01~S21).
+ * v2.2(2026-09-30 오프라인 점검) · v2.2.1(같은 날 구현 독립 검증 반영 — W07~W31, S01~S21)
+ * · v2.3(2026-10-01 주석 원문 블라인드 검증 249종목 반영 — XBRL '공시금액' 문맥, 본문에 없는 리스의 주석 보충,
+ *   주석 차입금 총계 잔액 보충, 구역별 누락·재무활동부채 조정표 대조, 사용권자산 대비 리스 누락 경고).
  *
  * 주의 — DART 의 ord 는 화면 표시 순서가 아니다. 형제 행은 account_id 정렬이고, 계층형 표시의
  * 자식 행만 부모 바로 뒤에 연속으로 온다. 그래서 "바로 앞 행" 같은 인접성은 계층 판정에만 쓴다.
@@ -24,7 +26,7 @@ import type { DartFinancialItem } from "./types";
 import type { XbrlDebtSummary } from "./xbrl-debt-facts";
 
 /** 엔진 판 — 수집 캐시가 이 값과 다르면 해당 보고서를 다시 계산한다 */
-export const IBD_ENGINE_VERSION = "ibd-v2.2.1";
+export const IBD_ENGINE_VERSION = "ibd-v2.3";
 
 /** 경고(checks) 중 참고(notes)로 볼 메시지 — v2.0 캐시 이관용 */
 const NOTE_PATTERNS = [/^금융 관련 업종/, /^주석 보충 적용 — 본문 '금융부채'/];
@@ -112,6 +114,12 @@ export interface IbdV2Result {
     financialSegment?: boolean;
     /** 매각예정 처분자산집단 */
     heldForSale?: { assets: number; liabilities: number; net: number };
+    /** 본문에 리스부채 행이 전혀 없음(리스 포함 차입 행도 없음) — 주석 리스 보충 후보 */
+    leaseAbsent: boolean;
+    /** 사용권자산(자산) 합계 — 리스부채를 못 찾았을 때 누락 가능성 판단 */
+    rouAssets: number;
+    /** 리스를 담을 수 있는 비차입 행(기타부채·기타금융부채·매입채무및기타채무 등)의 구역별 합계 */
+    leaseContainers: { current: number; nonCurrent: number; names: string[] };
   };
 }
 
@@ -245,7 +253,7 @@ const leaseInclusive = (n: string) => /판매후리스|유동화|차입/.test(n)
 /** AMBIG 행 경고 — (b) 차입 표지와 함께면 묶인 차입 행, (a) 차입 ID 인데 이름에 차입 표지가 없으면 차입금 아님 */
 function ambigCheck(id: string, name: string, tag: string): string | undefined {
   if (!AMBIG.test(name)) return undefined;
-  if (/차입|리스/.test(name) || BOND_WORD.test(name)) return `비차입 부채와 묶인 차입 행 — 전액 포함, 원문 확인: ${tag}`;
+  if (/차입|리스|유동성장기|유동화/.test(name) || BOND_WORD.test(name)) return `비차입 부채와 묶인 차입 행 — 전액 포함, 원문 확인: ${tag}`;
   if (hasStdId(id) && ID_BORROW.test(id)) return `계정명이 차입금 아님 — 원문 확인: ${tag}`;
   return undefined;
 }
@@ -455,6 +463,9 @@ export function computeIbdV2(items: DartFinancialItem[], opts: IbdEngineOptions 
       xbrlApplied: { debt: false, lease: false },
       xbrlStatus: null,
       dedupeRemoved: [],
+      leaseAbsent: false,
+      rouAssets: 0,
+      leaseContainers: { current: 0, nonCurrent: 0, names: [] },
     },
   };
 
@@ -498,6 +509,7 @@ export function computeIbdV2(items: DartFinancialItem[], opts: IbdEngineOptions 
     const amt = parseAmount(r.thstrm_amount);
 
     if (id === TOTAL_ASSETS_ID || NAME_TOTAL_ASSETS.test(name)) res.meta.totalAssets = amt;
+    if ((/RightofuseAssets$/i.test(id) || /^사용권자산$/.test(name)) && amt && amt > 0) res.meta.rouAssets += amt;
     // 머리 행·합계 행으로 구역 전환
     if (id === HDR_CURRENT_ID || NAME_HDR_CURRENT.test(name)) {
       section = "current";
@@ -590,6 +602,7 @@ export function computeIbdV2(items: DartFinancialItem[], opts: IbdEngineOptions 
 
   sectionChecks(res, rows, T, unproven);
   referenceNotes(res, bs, hasSections, fvtpl, finRelated);
+  leaseInfo(res, rows);
   recomputeTotal(res);
   postChecks(res);
   return res;
@@ -938,6 +951,35 @@ function sameAmountNotes(res: IbdV2Result, rows: Record<IbdSection, Row[]>) {
   }
 }
 
+// ─── 4b. 본문에 리스가 없는지, 리스를 담을 행이 있는지(주석 리스 보충 판단용) ───
+
+const CONTAINER_NAME = /기타|매입채무및|지급채무|금융부채|미지급|채무/;
+const CONTAINER_ID = /Other\w*(?:Liabilities|Payables)|TradeAndOther\w*Payables|OtherFinancialLiabilities/i;
+const NOT_CONTAINER = /충당|확정급여|법인세|계약부채|이연|선수|예수|보증금/;
+
+function leaseInfo(res: IbdV2Result, rows: Record<IbdSection, Row[]>) {
+  const all = [...rows.current, ...rows.nonCurrent, ...rows.unclassified];
+  const hasLeaseLine = [...res.current, ...res.nonCurrent, ...res.unclassified].some((l) => l.category === "lease");
+  const leaseNamed = all.some((r) => /리스/.test(r.name) && r.amt !== 0);
+  const leaseInclusive = res.notes.some((n) => n === LEASE_IN_BORROW_NOTE || n === LEASE_IN_BOND_NOTE);
+  res.meta.leaseAbsent = !res.excluded && !hasLeaseLine && !leaseNamed && !leaseInclusive;
+  const names: string[] = [];
+  for (const s of ["current", "nonCurrent"] as const) {
+    const unit = displayUnit(rows[s].filter((r) => r.amt !== 0));
+    const tolH = Math.max(unit * 3, 1000);
+    let sum = 0;
+    for (const r of rows[s]) {
+      if (r.line || r.contraName || r.removedParent || r.amt <= 0) continue;
+      if (!(CONTAINER_NAME.test(r.name) || CONTAINER_ID.test(r.id)) || NOT_CONTAINER.test(r.name)) continue;
+      if (hierarchicalChildren(rows[s], r, tolH, 2)) continue; // 계층 부모는 자식과 이중으로 세지 않는다
+      sum += r.amt;
+      names.push(r.raw);
+    }
+    res.meta.leaseContainers[s] = sum;
+  }
+  res.meta.leaseContainers.names = names;
+}
+
 // ─── 5. 구역 행 합계 대조 — 비차입 부모 행으로 설명되면 참고로 강등 ───
 
 function sectionChecks(
@@ -1009,8 +1051,9 @@ function referenceNotes(res: IbdV2Result, bs: DartFinancialItem[], hasSections: 
 
 // ─── 7. 사후 점검 ───
 
-const POST_CHECKS = [/^이자부부채 합계가 음수/, new RegExp(`^${EXCEEDS_TL_MSG}`)];
-const POST_REASONS = ["합계 음수", "부채총계 초과"];
+const LEASE_MISSING = "사용권자산이 있으나 리스부채를 찾지 못함";
+const POST_CHECKS = [/^이자부부채 합계가 음수/, new RegExp(`^${EXCEEDS_TL_MSG}`), new RegExp(`^${LEASE_MISSING}`)];
+const POST_REASONS = ["합계 음수", "부채총계 초과", "리스부채 누락 가능"];
 function postChecks(res: IbdV2Result) {
   res.checks = res.checks.filter((c) => !POST_CHECKS.some((p) => p.test(c)));
   // 사후 사유도 다시 판정(주석 보충 뒤 합계가 양수가 되면 '합계 음수' 제거)
@@ -1019,6 +1062,16 @@ function postChecks(res: IbdV2Result) {
   if (res.total < 0) {
     res.checks.push("이자부부채 합계가 음수 — 차감계정 판정 확인 필요");
     markPartial(res, "합계 음수");
+  }
+  // 본문·주석 어디서도 리스를 못 찾았는데 사용권자산이 있으면(분기 XBRL 에 리스 태그가 없는 회사 등) 누락 가능
+  res.notes = res.notes.filter((n) => !n.startsWith(LEASE_MISSING));
+  const rou = res.meta.rouAssets;
+  if (!res.excluded && res.meta.leaseAbsent && rou > 0 && ![...res.current, ...res.nonCurrent, ...res.unclassified].some((l) => l.category === "lease")) {
+    const msg = `${LEASE_MISSING}(사용권자산 ${eok(rou)}) — 리스가 기타부채 등에 포함됐을 가능성, 원문 확인`;
+    if (rou >= Math.max(1e9, 0.01 * (res.meta.totalLiabilities ?? 0))) {
+      res.checks.push(msg);
+      markPartial(res, "리스부채 누락 가능");
+    } else res.notes.push(msg);
   }
   const tl = res.meta.totalLiabilities;
   if (tl && tl > 0 && res.total > tl * 1.001) {
@@ -1057,15 +1110,24 @@ export function setXbrlStatus(res: IbdV2Result, status: XbrlStatus): void {
   markPartial(res, "주석 보충 필요하나 XBRL 없음");
 }
 
+/** 주석 보충이 필요한지 — 묶인 금융부채(차입 보충) 또는 본문에 리스가 전혀 없음(리스 보충) */
+export function needsXbrlNotes(res: IbdV2Result): boolean {
+  const a = res.meta.aggregatedFinancialLiabilities;
+  return !res.excluded && (!!a.current || !!a.nonCurrent || res.meta.leaseAbsent);
+}
+
 /**
- * 주석(XBRL) 보충 — 본문에 차입금·사채 없이 "금융부채"로 묶인 구역에 한해 주석 금액을 더한다.
- *  - 본문에 이미 있는 금액은 더하지 않는다(총계 폴백은 본문 차입과 대조해 잔액만)
- *  - 구역 부채 소계를 넘는 주석 금액은 보충하지 않는다(태깅 오류 방지)
- *  - 리스만 찾았으면 차입금은 미발견으로 본다
+ * 주석(XBRL) 보충.
+ *  (1) 차입 — 본문에 차입금·사채 없이 "금융부채"로 묶인 구역에 한해 주석 금액을 더한다.
+ *      본문에 이미 있는 금액은 더하지 않고(총계 폴백은 잔액만), 구역 부채 소계를 넘는 금액은 보충하지 않는다.
+ *      구역별로 못 넣은 곳이 있으면 알리고, 재무활동부채 조정표 합계와 대조해 과소 가능성을 알린다.
+ *  (2) 리스 — 본문에 리스부채 행이 전혀 없으면(기타부채 등에 포함된 회사), 주석 리스를 담을 수 있는 행이
+ *      있을 때만 더한다. 본문 차입금이 주석 차입금+리스와 같으면(차입금 행에 포함) 더하지 않는다.
  */
 export function applyXbrlSupplement(res: IbdV2Result, x: XbrlDebtSummary): void {
   const agg = res.meta.aggregatedFinancialLiabilities;
   const T = res.meta.sectionTotals;
+  const hasAgg = !!agg.current || !!agg.nonCurrent;
   let appliedDebt = false;
   let appliedLease = false;
   let skippedSame = false;
@@ -1097,102 +1159,210 @@ export function applyXbrlSupplement(res: IbdV2Result, x: XbrlDebtSummary): void 
     else add(s, label, amount, "borrowingsAndBonds");
     appliedDebt = true;
   };
+  const allLines = () => [...res.current, ...res.nonCurrent, ...res.unclassified];
   const hasLease = (s: IbdSection) => res[s].some((l) => l.category === "lease");
+  const bodyDebtOf = (lines: IbdLine[]) => lines.filter((l) => l.accountId !== "xbrl-note" && l.category !== "lease").reduce((a, l) => a + l.amount, 0);
+  const noteDebtIn = (s: IbdSection) => res[s].some((l) => l.accountId === "xbrl-note" && l.category !== "lease");
 
-  if (agg.current) {
-    addDebt("current", x.current, x.currentLoans, x.currentBonds);
-    if (!hasLease("current") && x.leaseCurrent && x.leaseCurrent > 0) {
-      add("current", "리스부채(주석)", x.leaseCurrent, "lease");
-      appliedLease = true;
+  // ── (1) 차입 보충 ──
+  if (hasAgg) {
+    if (agg.current) {
+      addDebt("current", x.current, x.currentLoans, x.currentBonds);
+      if (!hasLease("current") && x.leaseCurrent && x.leaseCurrent > 0) {
+        add("current", "리스부채(주석)", x.leaseCurrent, "lease");
+        appliedLease = true;
+      }
     }
-  }
-  if (agg.nonCurrent) {
-    addDebt("nonCurrent", x.nonCurrent, x.nonCurrentLoans, x.nonCurrentBonds);
-    if (!hasLease("nonCurrent") && x.leaseNonCurrent && x.leaseNonCurrent > 0) {
-      add("nonCurrent", "리스부채(주석)", x.leaseNonCurrent, "lease");
-      appliedLease = true;
+    if (agg.nonCurrent) {
+      addDebt("nonCurrent", x.nonCurrent, x.nonCurrentLoans, x.nonCurrentBonds);
+      if (!hasLease("nonCurrent") && x.leaseNonCurrent && x.leaseNonCurrent > 0) {
+        add("nonCurrent", "리스부채(주석)", x.leaseNonCurrent, "lease");
+        appliedLease = true;
+      }
     }
-  }
-
-  // 주석에 유동/비유동 구분 없이 차입금 총계만 있으면(셀트리온 2025.3Q 등) 본문 차입과 대조해 잔액만 — 항상 미구분 행
-  if (x.current == null && x.nonCurrent == null && x.total && x.total > 0) {
-    const body = [...res.current, ...res.nonCurrent, ...res.unclassified].filter((l) => l.accountId !== "xbrl-note");
-    const catOf = (l: IbdLine) => (l.category === "contra" ? l.netOf ?? "bonds" : l.category);
-    const sumCats = (cats: IbdOutCategory[]) => body.filter((l) => cats.includes(catOf(l))).reduce((a, l) => a + l.amount, 0);
-    const bLoan = sumCats(["borrowings", "otherDebt", "borrowingsAndBonds"]);
-    const bBond = sumCats(["bonds", "convertible"]);
-    const near = (a: number, b: number) => b > 0 && Math.abs(a - b) <= b * 0.01;
-    const singles = body.filter((l) => l.category !== "contra" && l.category !== "lease").map((l) => l.amount);
-    if (near(x.total, bLoan) || near(x.total, bLoan + bBond) || singles.some((v) => near(x.total!, v))) {
-      skippedSame = true;
-      res.notes.push("주석 차입금 총계가 본문 차입금과 같음 — 보충 생략");
-    } else {
-      const base = x.totalPartial && x.bondsIssued == null ? bLoan : bLoan + bBond;
-      const resid = x.total - base;
-      if (resid <= Math.max(0.01 * x.total, 1e8)) {
-        skippedSame = true;
-        res.notes.push(`주석 차입금 총계(${eok(x.total)})가 본문 차입금 이하 — 보충 생략`);
-      } else {
-        const cap = (agg.current ? T.current ?? 0 : 0) + (agg.nonCurrent ? T.nonCurrent ?? 0 : 0);
-        if (cap && resid > cap) {
-          res.checks.push(`주석 차입금 잔액 ${eok(resid)}이 부채 소계 ${eok(cap)}를 넘음 — 보충 보류`);
-          markPartial(res, "주석 차입금이 부채 소계 초과 — 보충 보류");
-          heldDebt = true;
-        } else {
-          const label = base > 0 ? "차입금·사채(주석 총계 − 본문, 유동/비유동 미구분)" : "차입금·사채(주석, 유동/비유동 미구분)";
-          const lr = x.loansReceived;
-          const bi = x.bondsIssued;
-          if (base <= 0 && lr != null && bi != null && lr + bi > 0 && Math.abs(lr + bi - resid) <= resid * 0.01) addSplit("unclassified", label, resid, lr, bi);
-          else if (base <= 0 && x.totalPartial && bi == null && lr != null) add("unclassified", `${label} 중 차입금`, resid, "borrowings");
-          else add("unclassified", label, resid, "borrowingsAndBonds");
+    // 주석 차입금 총계의 잔액 — 유동·비유동 중 일부 태그가 빠져도 총계는 태깅된 회사(LG디스플레이 유동성장기차입금 등).
+    // 총계 − (본문 차입 + 이미 넣은 주석 차입) 을 묶인 금융부채의 여유 안에서 채운다.
+    if (x.total && x.total > 0 && !heldDebt && (x.current != null || x.nonCurrent != null)) {
+      // 차입금 총계 태그가 리스까지 품었으면(유동+비유동과의 차이 = 리스) 리스를 빼고 본다
+      const comp = (x.current ?? 0) + (x.nonCurrent ?? 0);
+      const leases = [(x.leaseCurrent ?? 0) + (x.leaseNonCurrent ?? 0), x.leaseNonCurrent ?? 0, x.leaseCurrent ?? 0].filter((v) => v > 0);
+      const inclLease = leases.find((L) => Math.abs(x.total! - comp - L) <= L * 0.05) ?? 0;
+      const totalDebt = x.total - inclLease;
+      const noteDebtAdded = allLines().filter((l) => l.accountId === "xbrl-note" && l.category !== "lease").reduce((a, l) => a + l.amount, 0);
+      const resid = totalDebt - bodyDebtOf(allLines()) - noteDebtAdded;
+      if (resid > Math.max(0.01 * totalDebt, 1e8)) {
+        const capOf = (s: "current" | "nonCurrent") =>
+          agg[s] ? Math.max(0, Math.min(T[s] ?? Infinity, agg[s]!) - res[s].filter((l) => l.accountId === "xbrl-note").reduce((a, l) => a + l.amount, 0)) : 0;
+        const caps = { current: capOf("current"), nonCurrent: capOf("nonCurrent") };
+        const cat: IbdOutCategory = x.totalPartial && x.bondsIssued == null ? "borrowings" : "borrowingsAndBonds";
+        const one = (["current", "nonCurrent"] as const).filter((s) => caps[s] >= resid).sort((a, b) => caps[b] - caps[a])[0];
+        const capSum = caps.current + caps.nonCurrent;
+        if (one) {
+          add(one, `차입금·사채(주석 총계 잔액, ${SECTION_LABEL[one]} 추정)`, resid, cat);
           appliedDebt = true;
-          if (base > 0) res.checks.push(`주석 차입금 총계 ${eok(x.total)} 중 본문 차입금을 뺀 ${eok(resid)} 보충 — 원문 확인 권장`);
+          res.checks.push(`주석 차입금 총계 ${eok(totalDebt)} 중 구역 태그가 없는 ${eok(resid)}를 ${SECTION_LABEL[one]}로 추정 — 원문 확인 권장`);
+        } else if (capSum > 0 && resid <= capSum * 1.25) {
+          // 잔액이 묶인 금융부채 여유를 넘으면 그 행 전부를 차입으로 본다(여유분만 반영)
+          for (const s of ["current", "nonCurrent"] as const)
+            if (caps[s] > 0) add(s, `차입금·사채(주석 총계 잔액, 묶인 금융부채 전액)`, caps[s], cat);
+          appliedDebt = true;
+          res.checks.push(`주석 차입금 총계 잔액 ${eok(resid)}이 묶인 금융부채 여유 ${eok(capSum)}보다 커 여유분만 반영 — 원문 확인 권장`);
+        } else if (capSum > 0) {
+          res.checks.push(`주석 차입금 총계 잔액 ${eok(resid)} — 묶인 금융부채에 담을 수 없어 반영 보류`);
+          markPartial(res, "주석 차입금 총계 대비 과소");
+        }
+      }
+    }
+    // 주석에 유동/비유동 구분 없이 차입금 총계만 있으면(셀트리온 2025.3Q 등) 본문 차입과 대조해 잔액만 — 항상 미구분 행
+    if (x.current == null && x.nonCurrent == null && x.total && x.total > 0) {
+      const body = allLines().filter((l) => l.accountId !== "xbrl-note");
+      const catOf = (l: IbdLine) => (l.category === "contra" ? l.netOf ?? "bonds" : l.category);
+      const sumCats = (cats: IbdOutCategory[]) => body.filter((l) => cats.includes(catOf(l))).reduce((a, l) => a + l.amount, 0);
+      const bLoan = sumCats(["borrowings", "otherDebt", "borrowingsAndBonds"]);
+      const bBond = sumCats(["bonds", "convertible"]);
+      const near = (a: number, b: number) => b > 0 && Math.abs(a - b) <= b * 0.01;
+      const singles = body.filter((l) => l.category !== "contra" && l.category !== "lease").map((l) => l.amount);
+      if (near(x.total, bLoan) || near(x.total, bLoan + bBond) || singles.some((v) => near(x.total!, v))) {
+        skippedSame = true;
+        res.notes.push("주석 차입금 총계가 본문 차입금과 같음 — 보충 생략");
+      } else {
+        const base = x.totalPartial && x.bondsIssued == null ? bLoan : bLoan + bBond;
+        const resid = x.total - base;
+        if (resid <= Math.max(0.01 * x.total, 1e8)) {
+          skippedSame = true;
+          res.notes.push(`주석 차입금 총계(${eok(x.total)})가 본문 차입금 이하 — 보충 생략`);
+        } else {
+          const cap = (agg.current ? T.current ?? 0 : 0) + (agg.nonCurrent ? T.nonCurrent ?? 0 : 0);
+          if (cap && resid > cap) {
+            res.checks.push(`주석 차입금 잔액 ${eok(resid)}이 부채 소계 ${eok(cap)}를 넘음 — 보충 보류`);
+            markPartial(res, "주석 차입금이 부채 소계 초과 — 보충 보류");
+            heldDebt = true;
+          } else {
+            const label = base > 0 ? "차입금·사채(주석 총계 − 본문, 유동/비유동 미구분)" : "차입금·사채(주석, 유동/비유동 미구분)";
+            const lr = x.loansReceived;
+            const bi = x.bondsIssued;
+            if (base <= 0 && lr != null && bi != null && lr + bi > 0 && Math.abs(lr + bi - resid) <= resid * 0.01) addSplit("unclassified", label, resid, lr, bi);
+            else if (base <= 0 && x.totalPartial && bi == null && lr != null) add("unclassified", `${label} 중 차입금`, resid, "borrowings");
+            else add("unclassified", label, resid, "borrowingsAndBonds");
+            appliedDebt = true;
+            if (base > 0) res.checks.push(`주석 차입금 총계 ${eok(x.total)} 중 본문 차입금을 뺀 ${eok(resid)} 보충 — 원문 확인 권장`);
+          }
         }
       }
     }
   }
-  // 유동/비유동 구분 없이 리스 총계만 있으면 미구분으로(본문에 리스 행이 없을 때만)
-  if (
-    x.leaseCurrent == null &&
-    x.leaseNonCurrent == null &&
-    x.leaseTotal &&
-    x.leaseTotal > 0 &&
-    ![...res.current, ...res.nonCurrent, ...res.unclassified].some((l) => l.category === "lease")
-  ) {
-    add("unclassified", "리스부채(주석, 유동/비유동 미구분)", x.leaseTotal, "lease");
-    appliedLease = true;
+
+  // ── (2) 리스 — 본문에 리스 행이 전혀 없을 때(구역별로, 이미 리스를 넣은 구역은 건너뜀) ──
+  if (res.meta.leaseAbsent) {
+    const noteLeaseSplit = (x.leaseCurrent ?? 0) + (x.leaseNonCurrent ?? 0);
+    const noteLease = noteLeaseSplit || (x.leaseTotal ?? 0);
+    const noteDebt = x.total ?? (x.current != null || x.nonCurrent != null ? (x.current ?? 0) + (x.nonCurrent ?? 0) : null);
+    const bodyDebt = bodyDebtOf(allLines());
+    const C = res.meta.leaseContainers;
+    const near = (a: number, b: number, tol: number) => Math.abs(a - b) <= Math.abs(b) * tol;
+    if (noteLease > 0) {
+      const both = (noteDebt ?? 0) + noteLease;
+      const comp = (x.current ?? 0) + (x.nonCurrent ?? 0);
+      const leases = [noteLeaseSplit, x.leaseNonCurrent ?? 0, x.leaseCurrent ?? 0, x.leaseTotal ?? 0].filter((v) => v > 0);
+      // 차입금 총계 태그가 리스를 품고(총계 − 유동·비유동 = 리스) 본문 차입금이 그 총계와 같으면 — 리스는 차입금 행 안(LG화학·LG에너지솔루션)
+      const tagInclLease =
+        x.total != null && comp > 0 && leases.some((L) => near(x.total! - comp, L, 0.05)) && bodyDebt > 0 && near(bodyDebt, x.total, 0.01);
+      if (tagInclLease) {
+        res.notes.push(`본문 차입금(${eok(bodyDebt)})이 리스를 품은 주석 차입금 총계와 같음 — 리스가 차입금 행에 포함된 것으로 보고 리스 보충 생략`);
+      } else if (noteDebt != null && noteDebt > 0 && bodyDebt > 0 && near(bodyDebt, both, 0.01) && !near(bodyDebt, noteDebt, 0.01)) {
+        res.notes.push(`본문 차입금(${eok(bodyDebt)})이 주석 차입금+리스와 같음 — 리스가 차입금 행에 포함된 것으로 보고 리스 보충 생략`);
+      } else {
+        let added = false;
+        const miss: string[] = [];
+        if (noteLeaseSplit > 0) {
+          const pairs: ["current" | "nonCurrent", number | null, number | null][] = [
+            ["current", x.leaseCurrent, x.current],
+            ["nonCurrent", x.leaseNonCurrent, x.nonCurrent],
+          ];
+          for (const [s, amt, noteS] of pairs) {
+            if (!amt || amt <= 0 || hasLease(s)) continue;
+            // 그 구역 본문 차입이 주석 차입보다 딱 리스만큼 많으면 리스는 차입금 행 안
+            const bodyS = bodyDebtOf(res[s]);
+            if (noteS != null && bodyS > 0 && near(bodyS - noteS, amt, 0.05)) continue;
+            if (C[s] >= amt * 0.999) {
+              add(s, "리스부채(주석, 본문 기타부채 등에 포함)", amt, "lease");
+              added = true;
+            } else miss.push(`${SECTION_LABEL[s]} ${eok(amt)}`);
+          }
+        } else if (!allLines().some((l) => l.category === "lease")) {
+          if (C.current + C.nonCurrent >= noteLease * 0.999) {
+            add("unclassified", "리스부채(주석, 유동/비유동 미구분, 본문 기타부채 등에 포함)", noteLease, "lease");
+            added = true;
+          } else miss.push(`총계 ${eok(noteLease)}`);
+        }
+        if (added) {
+          appliedLease = true;
+          res.notes.push(`본문에 리스부채 행이 없어 주석 리스를 반영 — 본문 ${C.names.slice(0, 4).join("·") || "기타부채"} 등에 포함된 것으로 봄`);
+        }
+        if (miss.length) res.checks.push(`주석 리스 ${miss.join(", ")} — 본문에서 담긴 행을 찾지 못해 반영 보류, 원문 확인`);
+      }
+    }
   }
 
   res.checks = res.checks.filter((c) => !c.includes("주석(XBRL) 보충 필요"));
   res.meta.xbrlApplied = { debt: appliedDebt, lease: appliedLease };
   res.meta.xbrlSupplemented = appliedDebt || appliedLease;
-  res.meta.xbrlStatus = appliedDebt ? "applied" : heldDebt ? "held" : skippedSame ? "same_as_body" : appliedLease ? "lease_only" : "no_debt_elements";
+  if (hasAgg)
+    res.meta.xbrlStatus = appliedDebt ? "applied" : heldDebt ? "held" : skippedSame ? "same_as_body" : appliedLease ? "lease_only" : "no_debt_elements";
+  else if (appliedLease) res.meta.xbrlStatus = "lease_only";
 
-  if (!appliedDebt && !skippedSame && !heldDebt) {
-    // 무차입 회사의 '기타금융부채'(미지급·보증금 등)가 대부분이라, 묶인 금액이 부채의 30% 이상일 때만 경고
-    const share = aggShare(res);
-    const msg = "주석에서도 차입금·사채 금액을 찾지 못함 — 포괄 금융부채에 차입이 없거나 비표준 태그";
-    if (share != null && share >= 0.3) {
-      res.checks.push(`${msg} (금융부채가 부채의 ${Math.round(share * 100)}%)`);
-      markPartial(res, "포괄 금융부채 안의 차입금 미확인");
-    } else res.notes.push(msg);
-    if (appliedLease) res.notes.push("주석 리스만 보충 — 차입금·사채는 주석에서 찾지 못함");
-  } else if (heldDebt && !appliedDebt) {
-    if (appliedLease) res.notes.push("주석 리스만 보충 — 주석 차입금은 부채 소계 초과로 보류");
-  } else if (appliedDebt) {
-    if (x.reconciles === false) res.checks.push("주석 보충 적용 — 주석 차입금 총계와 유동+비유동 불일치, 원문 확인 필요");
-    else if (x.current == null && x.nonCurrent == null && x.totalPartial)
-      res.checks.push("주석 보충 적용 — 차입금(LoansReceived)·사채(BondsIssued) 합계로 산정, 유동/비유동 미구분 — 원문 확인 권장");
-    else res.notes.push("주석 보충 적용 — 본문 '금융부채' 안의 차입금·사채·리스를 주석 금액으로 산정");
-    for (const s of ["current", "nonCurrent"] as const) {
-      const a = agg[s];
-      const debt = res[s].filter((l) => l.accountId === "xbrl-note" && l.category !== "lease").reduce((p, l) => p + l.amount, 0);
-      if (a && debt > a * 1.05) res.checks.push(`${SECTION_LABEL[s]} 주석 차입 보충액이 본문 금융부채를 초과 — 원문 확인`);
+  if (hasAgg) {
+    const liab = (T.current ?? 0) + (T.nonCurrent ?? 0);
+    if (!appliedDebt && !skippedSame && !heldDebt) {
+      // 무차입 회사의 '기타금융부채'(미지급·보증금 등)가 대부분이라, 묶인 금액이 부채의 30% 이상일 때만 경고
+      const share = aggShare(res);
+      const msg = "주석에서도 차입금·사채 금액을 찾지 못함 — 포괄 금융부채에 차입이 없거나 비표준 태그";
+      if (share != null && share >= 0.3) {
+        res.checks.push(`${msg} (금융부채가 부채의 ${Math.round(share * 100)}%)`);
+        markPartial(res, "포괄 금융부채 안의 차입금 미확인");
+      } else res.notes.push(msg);
+      if (appliedLease) res.notes.push("주석 리스만 보충 — 차입금·사채는 주석에서 찾지 못함");
+    } else if (heldDebt && !appliedDebt) {
+      if (appliedLease) res.notes.push("주석 리스만 보충 — 주석 차입금은 부채 소계 초과로 보류");
+    } else if (appliedDebt) {
+      if (x.reconciles === false) res.checks.push("주석 보충 적용 — 주석 차입금 총계와 유동+비유동 불일치, 원문 확인 필요");
+      else if (x.current == null && x.nonCurrent == null && x.totalPartial)
+        res.checks.push("주석 보충 적용 — 차입금(LoansReceived)·사채(BondsIssued) 합계로 산정, 유동/비유동 미구분 — 원문 확인 권장");
+      else res.notes.push("주석 보충 적용 — 본문 '금융부채' 안의 차입금·사채·리스를 주석 금액으로 산정");
+      if (x.usedFallback) res.notes.push("주석 보충에 대체 요소(장기차입금·기타차입금·dart 사채) 사용");
+      for (const s of ["current", "nonCurrent"] as const) {
+        const a = agg[s];
+        const debt = res[s].filter((l) => l.accountId === "xbrl-note" && l.category !== "lease").reduce((p, l) => p + l.amount, 0);
+        if (a && debt > a * 1.05) res.checks.push(`${SECTION_LABEL[s]} 주석 차입 보충액이 본문 금융부채를 초과 — 원문 확인`);
+      }
+      // 구역별 누락 — 한 구역만 보충되면 다른 구역의 누락이 묻히지 않게
+      const coveredAll = res.unclassified.some((l) => l.accountId === "xbrl-note" && l.category !== "lease");
+      if (!coveredAll)
+        for (const s of ["current", "nonCurrent"] as const) {
+          const a = agg[s];
+          if (!a || noteDebtIn(s)) continue;
+          const share = liab > 0 ? a / liab : 0;
+          const msg = `${SECTION_LABEL[s]} 금융부채 ${eok(a)} 안의 차입금 미확인 — 주석에 해당 구역 태그 없음`;
+          if (share >= 0.1) {
+            res.checks.push(`${msg} (부채의 ${Math.round(share * 100)}%)`);
+            markPartial(res, `${SECTION_LABEL[s]} 금융부채 안의 차입금 미확인`);
+          } else res.notes.push(msg);
+        }
+    } else if (appliedLease) {
+      res.notes.push("주석 리스 보충 적용");
     }
-  } else if (appliedLease) {
-    res.notes.push("주석 리스 보충 적용");
   }
   recomputeTotal(res);
+  // 재무활동부채 조정표 합계와 대조 — 차입을 보충한 회사에서 남은 묶인 금액 안의 과소 가능성
+  if (appliedDebt && x.laffa && x.laffa > 0) {
+    const gap = x.laffa - res.total;
+    const noteDebt = allLines().filter((l) => l.accountId === "xbrl-note" && l.category !== "lease").reduce((a, l) => a + l.amount, 0);
+    const remaining = (agg.current ?? 0) + (agg.nonCurrent ?? 0) - noteDebt;
+    if (gap > Math.max(0.01 * x.laffa, 1e8) && gap <= remaining) {
+      res.checks.push(`재무활동부채 조정표 기말 ${eok(x.laffa)} 대비 ${eok(gap)} 적음 — 주석에 비표준 태그 차입 가능`);
+      markPartial(res, "재무활동부채 조정표 대비 과소");
+    }
+  }
   postChecks(res);
 }
 

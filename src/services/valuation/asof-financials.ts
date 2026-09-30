@@ -11,8 +11,11 @@
  * 엔진을 고친 뒤 다시 계산할 때 DART 를 다시 부르지 않는다(수집 스크립트·검증 코퍼스).
  */
 import { fetchFinancials, fetchStockQuantity, extractSharesInfo } from "../opendart/client";
-import { computeIbdV2, applyXbrlSupplement, setXbrlStatus, toCompactIbd, IBD_ENGINE_VERSION, type IbdV2Result, type XbrlStatus } from "../opendart/ibd-engine";
-import { fetchXbrlXmlStatus, parseXbrlInstantFacts, summarizeXbrlDebt, type XbrlFacts, type XbrlScope } from "../opendart/xbrl-debt-facts";
+import {
+  computeIbdV2, applyXbrlSupplement, setXbrlStatus, toCompactIbd, needsXbrlNotes, IBD_ENGINE_VERSION,
+  type IbdV2Result, type XbrlStatus,
+} from "../opendart/ibd-engine";
+import { fetchXbrlXmlStatus, parseXbrlInstantFactSets, summarizeXbrlDebt, type XbrlFacts, type XbrlScope } from "../opendart/xbrl-debt-facts";
 import type { DartFinancialItem } from "../opendart/types";
 import { fetchPeriodicReports, selectAsOfReport, monthsBeforeDate, type AsOfReport } from "../opendart/report-asof";
 import { extractFundamentals, type Fundamentals } from "../opendart/fundamentals";
@@ -49,8 +52,11 @@ export type FatalCheck = (e: unknown) => void;
 
 /** 보고서 한 건의 원자료 — 재계산·검증용 */
 export interface RawReport {
-  /** 1 = v2.2 이전(xbrl=null 에 통신 오류가 섞였을 수 있음), 2 = null 은 DART 013·014 로 확인된 '없음' */
-  v: 1 | 2;
+  /**
+   * 1 = v2.2 이전(xbrl=null 에 통신 오류가 섞였을 수 있음), 2 = null 은 DART 013·014 로 확인된 '없음',
+   * 3 = '공시금액' 문맥 사실(factsRpt)까지 보관
+   */
+  v: 1 | 2 | 3;
   /** DART 가 돌려준 접수번호(정정본이면 선택 보고서와 다를 수 있음) */
   rceptNoReturned: string;
   bsnsYear: string;
@@ -58,7 +64,7 @@ export interface RawReport {
   /** 재무상태표·손익(BS·IS·CIS) 행 — 필요한 필드만 */
   items: DartFinancialItem[];
   /** 주석 XBRL 의 당기말 차원 없는 사실(차입·사채·리스·부채 계열). null = 받았지만 없음, 없으면 아직 안 받음 */
-  xbrl?: { scope: XbrlScope; facts: XbrlFacts } | null;
+  xbrl?: { scope: XbrlScope; facts: XbrlFacts; factsRpt?: XbrlFacts } | null;
   /** 주식수 조회 결과(체인 적용 후). 없으면 아직 안 받음 */
   shares?: { outstanding: number | null; source?: string };
 }
@@ -93,7 +99,8 @@ function trimItems(items: DartFinancialItem[]): DartFinancialItem[] {
 }
 
 /** 주석 XBRL 을 (다시) 받아야 하는지 — 아직 안 받았거나, v1 이 저장한 null(통신 오류가 섞였을 수 있음) */
-export const needsXbrlFetch = (raw: RawReport) => raw.xbrl === undefined || (raw.v === 1 && raw.xbrl === null);
+export const needsXbrlFetch = (raw: RawReport) =>
+  raw.xbrl === undefined || (raw.v === 1 && raw.xbrl === null) || (raw.v < 3 && !!raw.xbrl && !raw.xbrl.factsRpt);
 
 /** 주석 XBRL 사실을 원자료에 채운다(필요할 때만 DART 호출). 검증 코퍼스는 모든 회사에 대해 부른다 */
 export async function ensureXbrlFacts(
@@ -110,8 +117,8 @@ export async function ensureXbrlFacts(
     return raw.xbrl;
   }
   const scope: XbrlScope = raw.fsDiv === "OFS" ? "SeparateMember" : "ConsolidatedMember";
-  raw.xbrl = got.xml ? { scope, facts: parseXbrlInstantFacts(got.xml, raw.bsnsYear, scope) } : null;
-  raw.v = 2;
+  raw.xbrl = got.xml ? { scope, ...parseXbrlInstantFactSets(got.xml, raw.bsnsYear, scope) } : null;
+  raw.v = 3;
   return raw.xbrl;
 }
 
@@ -138,12 +145,17 @@ export function computeIbdFromRaw(
   opts: { xbrlFetchFailed?: boolean } = {},
 ): IbdV2Result {
   const r = computeIbdV2(raw.items, { industryCode });
+  if (!needsXbrlNotes(r)) return r;
   const agg = r.meta.aggregatedFinancialLiabilities;
-  if (!r.excluded && (agg.current || agg.nonCurrent)) {
+  const hasAgg = !!agg.current || !!agg.nonCurrent;
+  const x = raw.xbrl;
+  const empty = !!x && Object.keys(x.facts).length === 0 && Object.keys(x.factsRpt ?? {}).length === 0;
+  if (x && !empty) applyXbrlSupplement(r, summarizeXbrlDebt(x.facts, x.factsRpt));
+  else if (hasAgg) {
+    // 차입 보충이 필요했는데 주석을 쓸 수 없음 — 상태별 경고(리스만 필요한 경우는 조용히 넘어간다)
     if (opts.xbrlFetchFailed) setXbrlStatus(r, "xml_error");
-    else if (raw.xbrl && Object.keys(raw.xbrl.facts).length === 0) setXbrlStatus(r, "context_not_found");
-    else if (raw.xbrl) applyXbrlSupplement(r, summarizeXbrlDebt(raw.xbrl.facts));
-    else if (raw.xbrl === null && raw.v === 2) setXbrlStatus(r, "xml_absent");
+    else if (empty) setXbrlStatus(r, "context_not_found");
+    else if (x === null && raw.v >= 2) setXbrlStatus(r, "xml_absent");
     else setXbrlStatus(r, "not_fetched"); // 오프라인 재계산에서 아직 못 받았거나 옛 null
   }
   return r;
@@ -176,7 +188,7 @@ export async function fetchFinForReport(
     }
     if (items.length === 0) return { ...base, error: "재무제표 없음" };
     raw = {
-      v: 2,
+      v: 3,
       rceptNoReturned: items[0].rcept_no,
       bsnsYear: year,
       // fetchFinancials 는 연결이 없으면 별도로 폴백하며, 실제 조회 구분을 fs_div 에 붙여 준다
@@ -194,7 +206,7 @@ export async function fetchFinForReport(
   const probe = computeIbdV2(items, { industryCode: c.industryCode });
   const agg = probe.meta.aggregatedFinancialLiabilities;
   let xbrlFetchFailed = false;
-  if (!probe.excluded && (agg.current || agg.nonCurrent) && needsXbrlFetch(raw)) {
+  if (needsXbrlNotes(probe) && needsXbrlFetch(raw)) {
     await ensureXbrlFacts(raw, rep.reprtCode, apiKey, (e) => {
       xbrlFetchFailed = true;
       onError(e);
