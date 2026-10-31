@@ -4,6 +4,7 @@ import { computeBetaData } from "../beta-calc";
 import type { ComputeBetaStockResult } from "../beta-calc";
 import { MAX_COMPUTE_STOCKS } from "../beta-calc/constants";
 import type { BetaLabel } from "../beta-calc/types";
+import { datagokrKey, FSC_SOURCE, MARKET_KEY_MISSING } from "../market/fsc";
 import { handleApiError } from "../utils/error-handler";
 
 const ComputeBetaInputSchema = z.object({
@@ -32,17 +33,17 @@ export function registerComputeBetaTool(server: McpServer): void {
   server.registerTool(
     "compute_beta",
     {
-      title: "베타 직접 계산 (네이버 기반, KICPA 비의존)",
-      description: `네이버 금융 주가 + KOSPI 지수로 베타계수를 **직접 회귀 계산**합니다.
-KICPA/KOSCOM 서버에 의존하지 않으므로 KICPA 장애 시에도 동작합니다.
+      title: "베타 직접 계산",
+      description: `수정주가 수익률을 KOSPI 지수 수익률에 **직접 회귀**해 베타계수를 계산합니다.
+
+[데이터] 금융위원회 주식시세정보·지수시세정보(공공데이터포털)를 **이용자 본인의 키**로 조회합니다.
+연결 주소의 datagokr_key(또는 x-datagokr-key 헤더)가 필요하고, 두 데이터셋을 활용신청해야 합니다.
+시세는 2020-01-02 이후만 있어 Monthly-5Y 는 2025년 이후 기준일에서 관측치 60개가 채워집니다(부족하면 note 에 표시).
 
 [방법론]
 - 수정주가 기준 주간/월간 수익률을 KOSPI 지수 수익률에 회귀(OLS)하여 실질베타를 산출
 - 조정베타 = 실질베타 × 2/3 + 1/3
-- Weekly-2Y(약 104주), Monthly-5Y(약 60개월) 관측치
-
-[정확도] 검증상 005930·000660의 분기말 Weekly-2Y/Monthly-5Y 가 과거 KICPA 공식값과
-소수점 6자리까지 일치했습니다. 분기말 캐시가 있으면 valuation_get_data 가 그 값을 우선 사용합니다.
+- Weekly-2Y(약 104주), Monthly-5Y(약 60개월) 관측치. 리샘플 규칙은 KICPA 공식값 재현 로직과 같습니다.
 
 Args:
   - stock_codes (string[]): 국내 종목코드 6자리 (최대 ${MAX_COMPUTE_STOCKS}개)
@@ -61,11 +62,14 @@ Examples:
         openWorldHint: true,
       },
     },
-    async (params: ComputeBetaInput) => {
+    async (params: ComputeBetaInput, extra: { requestInfo?: { headers?: Record<string, string | string[] | undefined> } }) => {
+      const key = datagokrKey(extra?.requestInfo?.headers);
+      if (!key) return { content: [{ type: "text" as const, text: `Error: ${MARKET_KEY_MISSING}` }], isError: true };
       try {
         const results = await computeBetaData({
           stockCodes: params.stock_codes,
           date: params.base_date,
+          key,
           periods: params.periods as BetaLabel[],
         });
 
@@ -96,9 +100,9 @@ function formatMarkdown(results: ComputeBetaStockResult[], periods: BetaLabel[])
   const parts: string[] = [];
   for (const r of results) {
     parts.push(`## ${r.stockName ?? r.stockCode} (${r.stockCode})`);
-    parts.push(`기준일: ${r.baseDate} · 출처: 네이버 직접계산(KICPA 비공식 근사)`);
+    parts.push(`기준일: ${r.baseDate} · 출처: ${FSC_SOURCE} 직접계산`);
     if (r.error) {
-      parts.push(`> ⚠️ ${r.error}`);
+      parts.push(`> ${r.error}`);
       parts.push("");
       continue;
     }
@@ -111,6 +115,7 @@ function formatMarkdown(results: ComputeBetaStockResult[], periods: BetaLabel[])
         `| ${label} | ${fmt(b?.raw)} | ${fmt(b?.adjusted)} | ${fmt(b?.rSquared, 4)} | ${b?.dataPoints ?? "-"} |`
       );
     }
+    if (r.note) parts.push("", `> ${r.note}`);
     parts.push("");
   }
   return parts.join("\n");

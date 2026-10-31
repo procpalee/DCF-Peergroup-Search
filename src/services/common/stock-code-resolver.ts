@@ -119,7 +119,7 @@ export async function getCompanyInfo(stockCode: string, apiKey?: string): Promis
 /**
  * 회사명/종목코드/corp_code로 검색 (fuzzy 지원)
  */
-export function searchCompanies(query: string, limit: number = 10): CorpCodeEntry[] {
+export function searchCompanies(query: string, limit: number = 10, listedOnly = false): CorpCodeEntry[] {
   const c = initCache();
   const q = query.trim();
   if (!q) return [];
@@ -139,6 +139,7 @@ export function searchCompanies(query: string, limit: number = 10): CorpCodeEntr
   const contains: CorpCodeEntry[] = [];
 
   for (const entry of c.entries) {
+    if (listedOnly && !entry.stock_code) continue;
     const name = entry.corp_name.toLowerCase().replace(/\s/g, "");
     if (name === qLower) exact.push(entry);
     else if (name.startsWith(qLower)) prefix.push(entry);

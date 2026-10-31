@@ -4,26 +4,26 @@
  * 사용법:
  *   npx tsx scripts/collect-valuation-cache.ts 20251231 20260331   # 지정 기준일
  *   npx tsx scripts/collect-valuation-cache.ts --latest             # 아직 없는 최근 분기말 1개
- *   npx tsx scripts/collect-valuation-cache.ts 20251231 --financials-only   # 재무만 재산정(주가·베타 진행파일 재사용)
+ *   npx tsx scripts/collect-valuation-cache.ts 20251231 --financials-only   # (하위호환 - 이제 항상 재무만 수집)
  *   npx tsx scripts/collect-valuation-cache.ts 20260331 --codes 005930,000660 --out /tmp/kvd   # 시범(일부 종목, 별도 폴더)
  *   npx tsx scripts/collect-valuation-cache.ts 20260630 --financials-only --recompute-all   # 엔진 판이 바뀐 보고서를 전부 재계산
  *
  * 재무 시점: 기준일 "당시" 공시된 최신 정기보고서(사업·반기·분기) — report-asof.ts.
  * 이자부부채: 재무상태표 본문 기준 엔진 v2(ibd-engine.ts) + 필요 시 XBRL 주석 보충.
- * 주식수: DART 유통주식수를 네이버 현재 상장주식수와 대조해 단위 오류 보정.
+ * 주식수: DART 유통주식수를 기준일 상장주식수(금융위원회 주식시세정보, DATA_GO_KR_API_KEY 가 있을 때)와 대조해 단위 오류 보정.
+ * 주가·베타는 수집하지 않는다(2026-10-31): 네이버 약관은 자동 수집을 금지하고, 공공데이터 시세는 제3자 제공·재배포 금지라
+ *   공개 저장소·서버에 둘 수 없다. 도구가 요청 때 이용자 키로 조회한다(src/services/market/fsc.ts).
  *
  * 단계(모두 이어받기 가능 — 중단 후 재실행하면 이어서 진행):
  *   1. 공시 목록 (회사당 1회, _shared/report-lists.json)
  *   2. 재무 (보고서 접수번호 단위로 결과 저장 → 여러 기준일이 같은 보고서를 쓰면 재사용, _shared/fin-v2.json)
  *      원자료(재무 행·XBRL 주석 사실·주식수)는 _shared/raw/ 에 보고서별로 보관 — 엔진 판이 바뀌면 DART 호출 없이 재계산.
- *   3. 참조 상장주식수 (네이버, 실행당 1회)
- *   4. 종가·베타 (기준일별, _progress/price-*.json · beta-*.json)
- *   5. 조립 → data/valuation-cache/{기준일}.json + {기준일}.meta.json
+ *   3. 참조 상장주식수 (기준일별 전 종목 1회, 단위 대조에만 쓰고 저장 파일에는 넣지 않음)
+ *   4. 조립 → data/valuation-cache/{기준일}.json + {기준일}.meta.json
  */
 import fs from "fs";
 import path from "path";
-import { fetchHistoricalPrices, fetchMarketData } from "../src/services/naver/client";
-import { computeBetaGridBatch } from "../src/services/beta-calc";
+import axios from "axios";
 import { getIndustryName } from "../src/services/opendart/ksic-codes";
 import {
   sanitizeShares, migrateIbdMessages, normalizeCompactIbd, IBD_ENGINE_VERSION, XBRL_ERROR_MSG, EXCEEDS_TL_MSG,
@@ -38,8 +38,6 @@ import type { DartListDoc } from "../src/services/opendart/document-parser";
 const ENGINE_VERSION = IBD_ENGINE_VERSION;
 const DART_BATCH_SIZE = 3;
 const DART_DELAY_MS = 1000; // 분당 ~180회
-const NAVER_CONCURRENCY = 10;
-const BETA_BATCH_SIZE = 20;
 const SAVE_INTERVAL = 50;
 
 const BASE_DIR = path.resolve(__dirname, "../data/valuation-cache");
@@ -152,17 +150,6 @@ function getStocks(asOf: string): Stock[] {
     .filter((s) => !s.listedDate || s.listedDate <= asOf);
 }
 
-/** 네이버 "1,579조 9,568억" → 원 */
-function parseKrw(s: string | null | undefined): number | null {
-  if (!s) return null;
-  let total = 0;
-  const jo = s.match(/([\d,]+)\s*조/);
-  const eok = s.match(/([\d,]+)\s*억/);
-  if (jo) total += Number(jo[1].replace(/,/g, "")) * 1e12;
-  if (eok) total += Number(eok[1].replace(/,/g, "")) * 1e8;
-  return total > 0 ? total : null;
-}
-
 // ─── 1. 공시 목록 ───
 
 async function ensureReportLists(stocks: Stock[], through: string): Promise<Record<string, ListsEntry>> {
@@ -268,78 +255,48 @@ async function collectFinancials(stocks: Stock[], asOf: string, lists: Record<st
   return { fin, pick };
 }
 
-// ─── 3. 참조 상장주식수 (네이버 현재 시총 ÷ 종가) ───
+// ─── 3. 참조 상장주식수 (금융위원회 주식시세정보, 기준일 전 종목) ───
 
-async function collectListedRef(stocks: Stock[]): Promise<Record<string, number | null>> {
-  const p = path.join(PROGRESS_DIR, `listed-ref-${today()}.json`);
-  const ref: Record<string, number | null> = loadJson(p) ?? {};
-  const todo = stocks.filter((s) => !(s.code in ref));
-  for (let i = 0; i < todo.length; i += NAVER_CONCURRENCY) {
-    await Promise.all(
-      todo.slice(i, i + NAVER_CONCURRENCY).map(async (s) => {
-        try {
-          const m = await fetchMarketData(s.code);
-          const cap = parseKrw(m.marketCap);
-          ref[s.code] = cap && m.price ? Math.round(cap / m.price) : null;
-        } catch {
-          ref[s.code] = null;
-        }
-      }),
-    );
-    if (i % (NAVER_CONCURRENCY * 30) === 0) saveJson(p, ref);
+const FSC_STOCK_API = "https://apis.data.go.kr/1160100/service/GetStockSecuritiesInfoService/getStockPriceInfo";
+
+/**
+ * 기준일(이전 최근 거래일) 전 종목 상장주식수. DART 주식수의 단위 오류(×1,000 등)를 잡는 대조값으로만 쓴다.
+ * 시세 데이터라 결과 파일에는 넣지 않는다. 키가 없으면 대조를 건너뛴다.
+ */
+async function collectListedRef(asOf: string): Promise<Record<string, number | null>> {
+  const key = process.env.DATA_GO_KR_API_KEY?.trim();
+  if (!key) {
+    console.log("[참조주식수] DATA_GO_KR_API_KEY 없음 - 단위 대조 생략");
+    return {};
   }
-  saveJson(p, ref);
-  console.log(`[참조주식수] ${Object.values(ref).filter(Boolean).length}/${stocks.length}`);
-  return ref;
-}
-
-// ─── 4. 종가·베타 (기준일별) ───
-
-async function collectPrices(stocks: Stock[], asOf: string): Promise<Record<string, number | null>> {
-  const p = path.join(PROGRESS_DIR, `price-${asOf}.json`);
-  const got: Record<string, number | null> = loadJson(p) ?? {};
-  const todo = stocks.filter((s) => !(s.code in got));
-  console.log(`[종가 ${asOf}] 미수집 ${todo.length}`);
-  const d = new Date(`${asOf.slice(0, 4)}-${asOf.slice(4, 6)}-${asOf.slice(6, 8)}`);
-  d.setDate(d.getDate() - 14);
-  const start = d.toISOString().slice(0, 10).replace(/-/g, "");
-  for (let i = 0; i < todo.length; i += NAVER_CONCURRENCY) {
-    await Promise.all(
-      todo.slice(i, i + NAVER_CONCURRENCY).map(async (s) => {
-        try {
-          const prices = (await fetchHistoricalPrices(s.code, start, asOf)).filter((x) => x.date <= asOf);
-          got[s.code] = prices.length ? prices[prices.length - 1].close : null;
-        } catch {
-          got[s.code] = null;
-        }
-      }),
-    );
-    if (i % (NAVER_CONCURRENCY * 30) === 0) saveJson(p, got);
-  }
-  saveJson(p, got);
-  return got;
-}
-
-type BetaGrid = Record<string, [number | null, number | null, number | null]> | null;
-async function collectBetas(stocks: Stock[], asOf: string): Promise<Record<string, { weekly: BetaGrid; monthly: BetaGrid }>> {
-  const p = path.join(PROGRESS_DIR, `beta-${asOf}.json`);
-  const got: Record<string, { weekly: BetaGrid; monthly: BetaGrid }> = loadJson(p) ?? {};
-  const codes = stocks.filter((s) => !(s.code in got)).map((s) => s.code);
-  console.log(`[베타 ${asOf}] 미수집 ${codes.length}`);
-  for (let i = 0; i < codes.length; i += BETA_BATCH_SIZE) {
-    const batch = codes.slice(i, i + BETA_BATCH_SIZE);
-    try {
-      const { weeklyMap, monthlyMap } = await computeBetaGridBatch(batch, asOf);
-      const compact = (r: { betas: Record<string, { raw: number | null; adjusted: number | null; dataPoints: number | null }> } | undefined): BetaGrid =>
-        r ? Object.fromEntries(Object.entries(r.betas).map(([k, v]) => [k, [v.raw, v.adjusted, v.dataPoints]])) : null;
-      for (const c of batch) got[c] = { weekly: compact(weeklyMap.get(c)), monthly: compact(monthlyMap.get(c)) };
-    } catch {
-      for (const c of batch) got[c] = { weekly: null, monthly: null };
+  const p = path.join(PROGRESS_DIR, `listed-ref-${asOf}.json`);
+  const saved = loadJson(p) as Record<string, number | null> | null;
+  if (saved) return saved;
+  // 휴장일이면 하루씩 앞으로(최대 10일)
+  for (let back = 0; back < 10; back++) {
+    const d = new Date(`${asOf.slice(0, 4)}-${asOf.slice(4, 6)}-${asOf.slice(6, 8)}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - back);
+    const basDt = d.toISOString().slice(0, 10).replace(/-/g, "");
+    const ref: Record<string, number | null> = {};
+    for (let page = 1; page < 5; page++) {
+      const res = await axios.get(FSC_STOCK_API, {
+        params: { serviceKey: key, resultType: "json", numOfRows: "5000", pageNo: String(page), basDt },
+        timeout: 60000,
+      });
+      const body = res.data?.response?.body ?? {};
+      let rows = body.items?.item ?? [];
+      if (!Array.isArray(rows)) rows = rows ? [rows] : [];
+      for (const r of rows as Array<Record<string, string>>) ref[r.srtnCd] = Number(r.lstgStCnt) || null;
+      if (Object.keys(ref).length >= Number(body.totalCount ?? 0) || rows.length === 0) break;
     }
-    if ((i / BETA_BATCH_SIZE) % SAVE_INTERVAL === 0) saveJson(p, got);
+    if (Object.keys(ref).length) {
+      saveJson(p, ref);
+      console.log(`[참조주식수] ${basDt} ${Object.keys(ref).length}종목`);
+      return ref;
+    }
   }
-  saveJson(p, got);
-  return got;
+  console.log("[참조주식수] 기준일 전후 시세 없음 - 단위 대조 생략");
+  return {};
 }
 
 // ─── 5. 조립 ───
@@ -432,14 +389,12 @@ function assemble(
   fin: Record<string, FinResult>,
   pick: Record<string, string | null>,
   listed: Record<string, number | null>,
-  prices: Record<string, number | null>,
-  betas: Record<string, { weekly: BetaGrid; monthly: BetaGrid }>,
   lists: Record<string, ListsEntry>,
 ) {
   const out: Record<string, unknown> = {};
   const stats = {
     total: 0, noReport: 0, ibdNull: 0, ibdExcluded: 0, xbrlSupplemented: 0, ibdChecks: 0, ibdPartial: 0, qualityHeld: 0,
-    xbrlError: 0, sharesFixed: 0, sharesNull: 0, priceNull: 0,
+    xbrlError: 0, sharesFixed: 0, sharesNull: 0,
   };
   const engineMix: Record<string, number> = {};
   for (const s of stocks) {
@@ -452,13 +407,10 @@ function assemble(
     const held = f0 ? qualityHold(f0, lists[s.corpCode]?.docs ?? [], fin) : null;
     const f: FinResult | null = f0 && held ? { ...f0, ibd: null, fundamentals: null, error: `데이터 품질 보류: ${held}` } : f0;
     if (held) stats.qualityHeld += 1;
-    const price = prices[s.code] ?? null;
-    // DART 주식수가 없으면(주식총수 API 013 — 셀트리온·SK 등) 네이버 현재 상장주식수로 대체
+    // DART 주식수가 없으면(주식총수 API 013 — 셀트리온·SK 등) 도구가 요청 때 이용자 키로 받은 상장주식수로 대체한다
     const sh0 = f?.sharesDart
       ? sanitizeShares(f.sharesDart, listed[s.code] ?? null)
-      : listed[s.code]
-        ? { shares: listed[s.code]!, note: "DART 주식수 없음 — 네이버 현재 상장주식수(기준일과 다를 수 있음)" }
-        : { shares: null, note: "주식수 없음" };
+      : { shares: null, note: "DART 주식수 없음" };
     const sh = f?.sharesSource
       ? { ...sh0, note: [`주식수는 ${f.sharesSource} 기준(해당 보고서 미기재)`, sh0.note].filter(Boolean).join("; ") }
       : sh0;
@@ -483,7 +435,6 @@ function assemble(
     if (ibd?.completeness === "partial") stats.ibdPartial += 1;
     if (sh.note?.includes("보정")) stats.sharesFixed += 1;
     if (!sh.shares) stats.sharesNull += 1;
-    if (!price) stats.priceNull += 1;
     const fu = f?.fundamentals ?? null;
     out[s.code] = {
       code: s.code,
@@ -491,18 +442,14 @@ function assemble(
       industry: { code: s.industryCode, name: getIndustryName(s.industryCode) },
       year: f?.report.bsnsYear ?? null,
       valuationDate: asOf,
-      beta: betas[s.code] ?? { weekly: null, monthly: null },
+      // 시세 기반 값(베타·종가·시가총액)은 저장하지 않는다 — valuation_get_data 가 이용자 키로 채운다
+      beta: { weekly: null, monthly: null },
       // 옛 판 결과(2-튜플)도 현재 형식([계정명, 금액, 범주])으로 맞춰 쓴다
       ibd,
       ...(f?.ibdExcluded ? { ibdExcluded: f.ibdExcluded } : {}),
       nci: fu?.nci ?? null,
       pretaxIncome: fu?.pretaxIncome ?? null,
-      marketCap: {
-        price,
-        shares: sh.shares,
-        total: price && sh.shares ? price * sh.shares : null,
-        ...(sh.note ? { sharesNote: sh.note } : {}),
-      },
+      marketCap: { price: null, shares: sh.shares, total: null, ...(sh.note ? { sharesNote: sh.note } : {}) },
       financials: f
         ? {
             report: {
@@ -528,7 +475,7 @@ async function main() {
     console.error("OPENDART_API_KEY 환경변수를 설정해주세요.");
     process.exit(1);
   }
-  const { dates, financialsOnly, codes, outDir } = parseArgs();
+  const { dates, codes, outDir } = parseArgs();
   const pickStocks = (asOf: string) => getStocks(asOf).filter((s) => !codes || codes.has(s.code));
   if (!dates.length) {
     console.log("수집할 기준일 없음 (인자로 YYYYMMDD 또는 --latest)");
@@ -540,16 +487,12 @@ async function main() {
   const allStocks = pickStocks(maxDate);
   try {
     const lists = await ensureReportLists(allStocks, maxDate);
-    const listed = await collectListedRef(allStocks);
     for (const asOf of dates) {
       console.log(`\n══ ${asOf} ══`);
       const stocks = pickStocks(asOf);
       const { fin, pick } = await collectFinancials(stocks, asOf, lists);
-      const prices = await collectPrices(stocks, asOf);
-      const betas = financialsOnly && fs.existsSync(path.join(PROGRESS_DIR, `beta-${asOf}.json`))
-        ? (loadJson(path.join(PROGRESS_DIR, `beta-${asOf}.json`)) as Record<string, { weekly: BetaGrid; monthly: BetaGrid }>)
-        : await collectBetas(stocks, asOf);
-      const { out, stats, engineMix } = assemble(stocks, asOf, fin, pick, listed, prices, betas, lists);
+      const listed = await collectListedRef(asOf);
+      const { out, stats, engineMix } = assemble(stocks, asOf, fin, pick, listed, lists);
       const dest = outDir ?? BASE_DIR;
       ensureDir(dest);
       saveJson(path.join(dest, `${asOf}.json`), out);

@@ -1,15 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { computeBetaGridBatch } from "../beta-calc";
+import { fetchMarketBatch, type MarketResult } from "../beta-calc";
 import { resolveCorpCode, getCompanyInfo } from "../common/stock-code-resolver";
-import { fetchMarketData, fetchHistoricalPrices } from "../naver/client";
+import { datagokrKey, FSC_SOURCE, MARKET_KEY_MISSING } from "../market/fsc";
 import { handleApiError } from "../utils/error-handler";
 import { getCachedValuation } from "../cache/valuation-cache";
 import { getIndustryName } from "../opendart/ksic-codes";
 import { sanitizeShares, type CompactIbd } from "../opendart/ibd-engine";
 import { formatIbd, type IbdOutput } from "../valuation/ibd-output";
 import { resolveAsOfFinancials, type FinResult } from "../valuation/asof-financials";
-import type { StockBetaResult } from "../kicpa/types";
 
 // ─── 스키마 ───
 
@@ -53,6 +52,8 @@ export interface CompactResult {
   nci: number | null;
   pretaxIncome: number | null;
   marketCap: { price: number | null; shares: number | null; total: number | null; sharesNote?: string };
+  /** 종가·베타 출처와 종가 거래일. 이용자 키가 없거나 조회가 실패하면 error */
+  market?: { source: string; priceDate: string | null; note?: string; error?: string };
   /** 사용 보고서와 현금·자본·실적(손익은 incomeMonths 개월 누적) */
   financials?: ({ report: { rceptNo: string; name: string; filedDate: string; period: string; fs: string | null } } & Record<string, unknown>) | null;
   derived?: { netDebt: number; enterpriseValue: number | null; note: string };
@@ -73,8 +74,10 @@ export function registerValuationDataTool(server: McpServer): void {
 [시점 규칙]
 - 재무(이자부부채·비지배지분·현금·자본·실적·주식수): 평가기준일 당시 이미 공시된 최신 정기보고서
   (예: 2025-03-31 → 2024 사업보고서, 2025-06-30 → 2025 1분기보고서). 사용 보고서는 financials.report 에 표시.
-- 주가: 평가기준일(이전 최근 거래일) 종가. 베타: 기준일까지의 네이버 주가 + KOSPI 회귀.
-- 분기말은 사전 수집 캐시로 즉시 응답, 그 외 날짜는 같은 규칙으로 실시간 계산.
+- 주가: 평가기준일(이전 최근 거래일) 종가. 베타: 기준일까지의 수정주가 + KOSPI 지수 회귀.
+- 주가·베타는 금융위원회 주식시세·지수시세(공공데이터포털)를 이용자 본인 키로 요청 때 조회한다(2020-01-02 이후, T+1).
+  키가 없으면 재무만 돌려주고 market.error 에 키 설정 방법을 싣는다 — 그 문장을 사용자에게 그대로 전달하세요.
+- 재무는 분기말이면 사전 수집 캐시로 즉시 응답, 그 외 날짜는 같은 규칙으로 실시간 계산.
 
 [⚠️ 필수 입력 — 둘 다 없으면 호출이 거부됩니다]
 1. 종목코드 (stock_codes 또는 stock_code). 회사명만 있으면 먼저 search_stock 으로 종목코드를 조회하세요.
@@ -90,16 +93,16 @@ export function registerValuationDataTool(server: McpServer): void {
   debtLike [계정명, 금액, 유형(계정명 기준 추정: rcps·cps·convDerivative·hybrid·unknown)]는 합계에서 제외 — 내가격 전환이면 희석, 아니면 부채 가산을 검토.
   checks 는 원문 확인이 필요한 경고, notes 는 참고. 금융업(은행·보험·증권·여신전문·금융지주)은 ibd=null 이고 ibdExcluded 에 사유.
 - nci: 비지배지분, pretaxIncome: 세전이익
-- marketCap: { price, shares(유통주식수), total, sharesNote(주식수 보정·대체 설명) }
+- marketCap: { price, shares(유통주식수), total, sharesNote(주식수 보정·대체 설명) }, market: { source, priceDate(종가 거래일), note, error }
 - financials: 사용 보고서 + cash·shortTermDeposits·equityParent·revenue·operatingIncome·netIncomeParent·incomeTax (손익은 incomeMonths 개월 누적)
 - derived: netDebt(이자부부채−현금−단기금융상품), enterpriseValue(시가총액+순차입금+비지배지분)
 
 [Peer 워크플로우 Step 4]
-Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호출하세요. 이 도구 하나가 베타·이자부부채·비지배지분·세전이익·시가총액·현금·실적을 모두 반환하므로 같은 용도로 dart_get_financials / naver_get_market_data 를 따로 호출하지 마세요. 상세는 docs/PEER_GROUP_WORKFLOW.md 참조.`,
+Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호출하세요. 이 도구 하나가 베타·이자부부채·비지배지분·세전이익·시가총액·현금·실적을 모두 반환하므로 같은 용도로 dart_get_financials / compute_beta 를 따로 호출하지 마세요. 상세는 docs/PEER_GROUP_WORKFLOW.md 참조.`,
       inputSchema: ValuationDataInputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async (params: ValuationDataInput) => {
+    async (params: ValuationDataInput, extra: { requestInfo?: { headers?: Record<string, string | string[] | undefined> } }) => {
       // [필수 입력 검증] 종목 식별자 + 평가기준일
       const missing: string[] = [];
       const rawCodes = params.stock_codes ?? params.stock_code;
@@ -116,36 +119,27 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
       const apiKey = params.api_key;
 
       try {
-        // 0. 캐시 우선 조회
-        const cached: StoredResult[] = [];
-        const uncachedCodes: string[] = [];
+        // 1. 시세(종가·상장주식수·베타): 이용자 키로 요청 때 조회 — 서버는 시세를 저장하지 않는다
+        const key = datagokrKey(extra?.requestInfo?.headers);
+        const market = key ? await fetchMarketBatch(codes, valuationDate, key) : null;
 
+        // 2. 재무: 분기말 캐시 우선, 미스 종목만 라이브(DART)
+        const resultMap = new Map<string, StoredResult>();
+        const uncachedCodes: string[] = [];
         for (const code of codes) {
           const hit = await getCachedValuation(code, valuationDate);
-          if (hit) {
-            cached.push(hit);
-          } else {
-            uncachedCodes.push(code);
-          }
+          if (hit) resultMap.set(code, hit);
+          else uncachedCodes.push(code);
         }
-
-        // 캐시 미스가 있을 때만 라이브 API 호출
-        let liveResults: StoredResult[] = [];
-        if (uncachedCodes.length > 0) {
-          // 1. 베타: 캐시(분기말)가 없는 기준일이므로 KICPA 대신 네이버 기반 직접 계산
-          //    (Weekly/Monthly × 1/2/3/5Y 전체 그리드)
-          const { weeklyMap, monthlyMap } = await computeBetaGridBatch(uncachedCodes, valuationDate);
-
-          // 2. 미스 종목만 재무/주식수/시장/XBRL — 병렬
-          liveResults = await Promise.all(uncachedCodes.map((code) => processCompany(code, valuationDate, apiKey, weeklyMap, monthlyMap)));
-        }
-
-        // 3. 캐시 + 라이브 결과 병합 (요청 순서 유지)
-        const resultMap = new Map<string, StoredResult>();
-        for (const r of cached) resultMap.set(r.code, r);
+        const liveResults = await Promise.all(
+          uncachedCodes.map((code) => processCompany(code, valuationDate, apiKey, market?.get(code)?.listedShares ?? null)),
+        );
         for (const r of liveResults) resultMap.set(r.code, r);
-        // 베타는 Weekly-2Y, Monthly-5Y 두 가지만 노출 (기존 캐시 파일은 그대로 두되 출력만 축소)
-        const results = codes.map((code) => finalize(resultMap.get(code)!, params.ibd_detail ?? false));
+
+        // 3. 재무 + 시세 결합 (요청 순서 유지). 캐시에 옛 시세 필드가 남아 있어도 항상 이번 조회값으로 덮는다
+        const results = codes.map((code) =>
+          finalize(withMarket(resultMap.get(code)!, market?.get(code) ?? null, !!key), params.ibd_detail ?? false),
+        );
 
         // 4. 응답: 단일이면 객체, 다중이면 배열
         const output = results.length === 1 ? results[0] : results;
@@ -162,25 +156,17 @@ Peer Group이 확정된 후 최대 10개 stock_codes 배열로 "한 번만" 호�
 /**
  * 캐시에 없는 기준일 — 수집 스크립트와 같은 규칙으로 계산한다.
  *  재무: 기준일 당시 공시된 최신 정기보고서(asof-financials) — 이자부부채 엔진 v2
- *  주가: 기준일(이전 최근 거래일) 종가 — 과거에는 오늘 현재가를 써서 시가총액이 틀렸다
- *  주식수: DART 유통주식수를 네이버 현재 상장주식수와 대조해 단위 오류 보정
+ *  주식수: DART 유통주식수를 기준일 상장주식수(이용자 키로 조회한 시세, 없으면 대조 생략)와 대조해 단위 오류 보정
+ *  주가·베타는 withMarket 에서 붙인다.
  */
 async function processCompany(
   code: string,
   valuationDate: string,
   apiKey: string | undefined,
-  weeklyMap: Map<string, StockBetaResult>,
-  monthlyMap: Map<string, StockBetaResult>,
+  listedShares: number | null,
 ): Promise<StoredResult> {
   const corpCode = await resolveCorpCode(code);
-  const start = shiftDays(valuationDate, -14);
-
-  const [companyResult, pricesResult, marketResult] = await Promise.allSettled([
-    getCompanyInfo(code, apiKey),
-    fetchHistoricalPrices(code, start, valuationDate),
-    fetchMarketData(code),
-  ]);
-  const info = companyResult.status === "fulfilled" ? companyResult.value : null;
+  const info = await getCompanyInfo(code, apiKey).catch(() => null);
   const industryCode = info?.induty_code || null;
 
   let fin: FinResult | null = null;
@@ -194,23 +180,8 @@ async function processCompany(
     fin = null;
   }
 
-  // 기준일 이하 마지막 거래일 종가
-  const closes = pricesResult.status === "fulfilled"
-    ? pricesResult.value.filter((p) => p.date <= valuationDate)
-    : [];
-  const price = closes.length ? closes[closes.length - 1].close : null;
-
-  // 참조 상장주식수 = 네이버 현재 시총 ÷ 현재가 (단위 오류 판별용)
-  let ref: number | null = null;
-  if (marketResult.status === "fulfilled") {
-    const cap = parseKrw(marketResult.value.marketCap);
-    ref = cap && marketResult.value.price ? Math.round(cap / marketResult.value.price) : null;
-  }
-  const sh = fin?.sharesDart
-    ? sanitizeShares(fin.sharesDart, ref)
-    : ref
-      ? { shares: ref, note: "DART 주식수 없음 — 네이버 현재 상장주식수(기준일과 다를 수 있음)" }
-      : { shares: null, note: "주식수 없음" };
+  // 상장주식수가 없으면(키 없음) 단위 대조 없이 DART 값을 그대로 쓴다. DART 주식수가 없을 때의 대체는 withMarket 에서
+  const sh = fin?.sharesDart ? sanitizeShares(fin.sharesDart, listedShares) : { shares: null, note: "DART 주식수 없음" };
   const sharesNote = [fin?.sharesSource ? `주식수는 ${fin.sharesSource} 기준(해당 보고서 미기재)` : null, sh.note]
     .filter(Boolean)
     .join("; ");
@@ -222,17 +193,12 @@ async function processCompany(
     industry: industryCode ? { code: industryCode, name: getIndustryName(industryCode) } : null,
     year: fin?.report.bsnsYear ?? null,
     valuationDate,
-    beta: { weekly: compactBetas(weeklyMap.get(code)), monthly: compactBetas(monthlyMap.get(code)) },
+    beta: { weekly: null, monthly: null },
     ibd: fin?.ibd ?? null,
     ...(fin?.ibdExcluded ? { ibdExcluded: fin.ibdExcluded } : {}),
     nci: fu?.nci ?? null,
     pretaxIncome: fu?.pretaxIncome ?? null,
-    marketCap: {
-      price,
-      shares: sh.shares,
-      total: price && sh.shares ? price * sh.shares : null,
-      ...(sharesNote ? { sharesNote } : {}),
-    },
+    marketCap: { price: null, shares: sh.shares, total: null, ...(sharesNote ? { sharesNote } : {}) },
     financials: fin
       ? {
           report: {
@@ -277,29 +243,38 @@ function finalize(s: StoredResult, ibdDetail: boolean): CompactResult {
   };
 }
 
-function shiftDays(yyyymmdd: string, days: number): string {
-  const d = new Date(`${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().slice(0, 10).replace(/-/g, "");
-}
-
-/** 네이버 "1,579조 9,568억" → 원 */
-function parseKrw(s: string | null | undefined): number | null {
-  if (!s) return null;
-  let total = 0;
-  const jo = s.match(/([\d,]+)\s*조/);
-  const eok = s.match(/([\d,]+)\s*억/);
-  if (jo) total += Number(jo[1].replace(/,/g, "")) * 1e12;
-  if (eok) total += Number(eok[1].replace(/,/g, "")) * 1e8;
-  return total > 0 ? total : null;
-}
-
-/** BetaValues → compact [raw, adjusted, dataPoints] 배열로 변환 */
-function compactBetas(result: StockBetaResult | undefined): Record<string, [number | null, number | null, number | null]> | null {
-  if (!result) return null;
-  const out: Record<string, [number | null, number | null, number | null]> = {};
-  for (const [period, vals] of Object.entries(result.betas)) {
-    out[period] = [vals.raw, vals.adjusted, vals.dataPoints];
+/**
+ * 재무 결과에 이번 요청의 시세를 붙인다. 캐시 파일의 beta·price 는 쓰지 않는다
+ * (옛 캐시에 네이버 기반 값이 남아 있어도 내보내지 않기 위함).
+ */
+function withMarket(s: StoredResult, m: MarketResult | null, hasKey: boolean): StoredResult {
+  const base: StoredResult = {
+    ...s,
+    beta: { weekly: null, monthly: null },
+    marketCap: { ...s.marketCap, price: null, total: null },
+    market: { source: FSC_SOURCE, priceDate: null, error: hasKey ? "시세 조회 결과 없음" : MARKET_KEY_MISSING },
+  };
+  if (!m) return base;
+  let shares = s.marketCap.shares;
+  let sharesNote = s.marketCap.sharesNote;
+  if (!shares && m.listedShares) {
+    shares = m.listedShares;
+    sharesNote = [sharesNote, `기준일(${m.priceDate}) 상장주식수로 대체 - 자기주식 미차감`].filter(Boolean).join("; ");
   }
-  return out;
+  return {
+    ...base,
+    beta: m.beta,
+    marketCap: {
+      price: m.price,
+      shares,
+      total: m.price && shares ? m.price * shares : null,
+      ...(sharesNote ? { sharesNote } : {}),
+    },
+    market: {
+      source: FSC_SOURCE,
+      priceDate: m.priceDate,
+      ...(m.note ? { note: m.note } : {}),
+      ...(m.error ? { error: m.error } : {}),
+    },
+  };
 }

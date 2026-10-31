@@ -14,7 +14,9 @@
 - "반도체/자동차/바이오 Peer 5개 뽑아서 재무 비교"
 - 특정 종목 밸류에이션 산정을 위한 **유사 기업 탐색**
 
-라이브 실시간 주가·PER/PBR 단건 조회 같은 요청에는 이 워크플로우가 과합니다 — `naver_get_market_data` 단독 사용이 맞습니다.
+특정 기준일 베타 단건 계산 같은 요청에는 이 워크플로우가 과합니다 — `compute_beta` 단독 사용이 맞습니다.
+
+> **시세는 이용자 키로만 나옵니다(2026-10-31).** 종가·시가총액·베타는 공공데이터포털 금융위원회 시세를 이용자 본인 키(`datagokr_key`)로 요청 때 계산합니다. 키가 없으면 `valuation_get_data` 는 재무만 돌려주고 `market.error` 에 설정 방법을 싣습니다 — 그 안내를 사용자에게 그대로 전달하세요. 시세는 2020-01-02 이후만 있어 Monthly-5Y 관측치 60개는 2025년 이후 기준일부터 채워집니다(부족하면 `market.note`).
 
 ---
 
@@ -27,15 +29,15 @@
 | `data/company-industry.json` | 전 상장사 | 종목코드 ↔ 회사명 ↔ KSIC 업종코드 + 시장구분/결산월/상장일 | `search_by_industry` |
 | `data/peer-snapshot/20250331.json.gz`<br>`… 20250630 / 20250930 / 20251231` | 각 ~2,590 | **Peer 모집단 스냅샷** (분기말 시점 고정, 불변)<br>사업의 개요 + 부문별 매출(매출 및 수주상황 표)<br>배제판단 플래그 (스팩/지주사/리츠/12월외결산/관리종목)<br>근거 보고서 메타 (rceptNo/유형/접수일) | `peergroup_get_population` |
 | `data/business-cache/2025.json.gz` | 2,611 / 2,617 (99.8%) | 사업보고서 "II. 사업의 내용" 본문 (주요 제품 및 서비스) | `get_business_content` |
-| `data/valuation-cache/20250331.json`<br>`data/valuation-cache/20250630.json`<br>`data/valuation-cache/20250930.json`<br>`data/valuation-cache/20251231.json` | 각 2,617 | **베타** (W/M × 1/2/3/5Y)<br>**이자부부채** (유동/비유동 세부)<br>**비지배지분**<br>**세전이익**<br>**시가총액** (price / shares / total) | `valuation_get_data` |
+| `data/valuation-cache/20250331.json`<br>`data/valuation-cache/20250630.json`<br>`data/valuation-cache/20250930.json`<br>`data/valuation-cache/20251231.json` | 각 2,617 | **이자부부채** (유동/비유동 세부)<br>**비지배지분**<br>**세전이익**<br>**주식수**·현금·자본·실적<br>(베타·종가·시가총액은 저장하지 않음 - 요청 때 이용자 키로 계산) | `valuation_get_data` |
 | `data/corp-codes.json` | 전 상장사 | 종목코드 ↔ DART corp_code | (내부) |
 
 ### 핵심 원칙
 
 > **평가기준일(`valuation_date`)이 분기말(0331 / 0630 / 0930 / 1231)이라면, `valuation_get_data` 한 번 호출로 베타 + 이자부부채 + 비지배지분 + 세전이익 + 시가총액이 전부 나옵니다.**
 
-이 경우 `compute_beta`, `dart_get_financials`, `naver_get_market_data`를 따로 호출할 이유가 **없습니다**. 따로 부르면:
-- ❌ 라이브 소스(네이버, DART)를 불필요하게 호출
+이 경우 `compute_beta`, `dart_get_financials`를 따로 호출할 이유가 **없습니다**. 따로 부르면:
+- ❌ 라이브 소스(시세, DART)를 불필요하게 호출
 - ❌ 응답이 10배 이상 느려짐
 - ❌ 캐시된 값과 미세한 수치 차이 발생 가능
 
@@ -175,11 +177,10 @@ valuation_get_data(
 | **Peer 모집단 + 개요/부문별매출 (분기말)** | ✅ 캐시 (라이브 폴백 **없음** — 결정론 보장) | `peergroup_get_population` |
 | 업종별 상장사 리스트 (최신, 시점 미고정) | ✅ 캐시 | `search_by_industry` |
 | 사업 내용 원문 (2025 사업연도) | ✅ 캐시 | `get_business_content(year="2025")` |
-| 베타 (분기말) | ✅ 캐시 | `valuation_get_data(valuation_date=YYYY{0331,0630,0930,1231})` |
+| 베타 (분기말) | 🧮 직접계산(이용자 키) | `valuation_get_data(valuation_date=YYYY{0331,0630,0930,1231})` |
 | 이자부부채 / NCI / 세전이익 (분기말) | ✅ 캐시 | `valuation_get_data` 동일 호출 |
-| 시가총액 (분기말) | ✅ 캐시 | `valuation_get_data` 동일 호출 |
+| 시가총액 (분기말) | 🧮 종가는 이용자 키, 주식수는 캐시 | `valuation_get_data` 동일 호출 |
 | **임의 영업일** 베타 | 🧮 직접계산 | `valuation_get_data`(베타 자동 직접계산) 또는 `compute_beta` |
-| **당일** 주가·PER·PBR·컨센서스 | ❌ 라이브 | `naver_get_market_data` |
 | 분기/반기 보고서 재무, 전체 계정 | ❌ 라이브 | `dart_get_financials` |
 | 사업연도 2025 외 (예: 2023 사업보고서) | ❌ 라이브 | `get_business_content(year="2023")` (DART 실시간 다운로드) |
 
@@ -194,7 +195,7 @@ valuation_get_data(
 | `search_by_industry` 결과로 모집단 확정 (시점 미고정 — 재실행 시 결과가 달라질 수 있음) | `peergroup_get_population(valuation_date, industry_code)` 으로 결정론적 확정 |
 | 모집단 필터링을 위해 `get_business_content` 를 종목마다 호출 (종목당 20~40KB) | `peergroup_get_population(include_content=true, page=N)` 페이지 순회 (종목당 ~5KB) |
 | `include_content=true` 를 page 없이 같은 페이지만 반복 호출 | `meta.nextPage` 를 따라 순회 |
-| Peer 5개에 대해 `compute_beta` + `dart_get_financials` + `naver_get_market_data` 각각 호출 | `valuation_get_data(stock_codes=[...5개], valuation_date="20251231")` 한 번 |
+| Peer 5개에 대해 `compute_beta` + `dart_get_financials` 각각 호출 | `valuation_get_data(stock_codes=[...5개], valuation_date="20251231")` 한 번 |
 | `get_business_content`를 5개 종목에 동시에 배치 호출 | 최종 후보 2~3개만, 한 종목씩 |
 | 분기말이면 더 빠름(캐시) — 임의 평일은 직접계산이라 다소 느릴 수 있음 | 가능하면 분기말 기준일 사용 |
 | `valuation_date` 를 모른 채 오늘 날짜로 호출 | 사용자에게 평가기준일 확인 후 호출 |
@@ -220,7 +221,7 @@ valuation_get_data(
 5. `valuation_get_data(stock_codes=["000660","042700","240810","005070","<피어5>"], valuation_date="20251231")`
 6. 반환된 JSON을 파싱해서 Weekly-2Y / Monthly-5Y 조정베타 평균·중앙값, IBD 합계, 시총 합계를 표로 정리
 
-**절대 호출하지 말 것**: `dart_get_financials`, `naver_get_market_data` (valuation_get_data 가 모두 포함)
+**절대 호출하지 말 것**: `dart_get_financials`, `compute_beta` (valuation_get_data 가 모두 포함)
 
 ### 예시 2 — 특정 회사 사업 내용만 빠르게
 

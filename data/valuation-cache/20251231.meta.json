@@ -17,7 +17,7 @@
     "qualityHeld": 2,
     "xbrlError": 0,
     "sharesFixed": 4,
-    "sharesNull": 0,
-    "priceNull": 6
-  }
+    "sharesNull": 59
+  },
+  "marketFieldsRemoved": "2026-10-31 베타·종가·시가총액 제거(시세는 도구가 이용자 키로 조회)"
 }

@@ -6,6 +6,8 @@
 # 완성된 기준일 파일만 품질 검사를 통과하면 커밋 → Vercel 자동 배포.
 #
 # 필요 설정: 저장소 Settings → Secrets → Actions 에 OPENDART_API_KEY
+#           (선택) DATA_GO_KR_API_KEY — 공공데이터포털 키. 있으면 DART 주식수를 기준일 상장주식수와 대조해 단위 오류를 보정한다
+#                  (시세는 결과 파일에 넣지 않는다 — 제3자 제공·재배포 금지 데이터)
 #           (선택) BLOB_READ_WRITE_TOKEN — Vercel Blob 저장소 토큰. 있으면 캐시 파일을 Blob 에도 올린다
 # 개요·부문 매출 LLM 요약(summarize-peer-snapshot)은 로컬에서 수동 실행한다(2026-09-30 결정).
 
@@ -65,6 +67,7 @@ jobs:
         id: valuation
         env:
           OPENDART_API_KEY: ${{ secrets.OPENDART_API_KEY }}
+          DATA_GO_KR_API_KEY: ${{ secrets.DATA_GO_KR_API_KEY }}
           DATES: ${{ github.event.inputs.dates }}
         run: |
           set +e

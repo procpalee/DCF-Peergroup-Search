@@ -15,7 +15,6 @@ const DIR = path.resolve(__dirname, "../data/valuation-cache");
 /** 전체 종목 대비 허용 비율 */
 const LIMITS = {
   noReport: 0.05, // 기준일 당시 정기보고서를 못 고른 종목
-  priceNull: 0.03, // 기준일 종가 없음(거래정지 등)
   sharesNull: 0.03,
   ibdChecks: 0.2, // 이자부부채 산정 경고가 붙은 종목
   sharesJump: 0.02, // 직전 분기 대비 주식수 3배 이상 변동
@@ -52,7 +51,6 @@ for (const d of dates) {
   const n = s.total || 1;
   const rows: [string, number, number][] = [
     ["보고서 미선택", s.noReport / n, LIMITS.noReport],
-    ["종가 없음", s.priceNull / n, LIMITS.priceNull],
     ["주식수 없음", s.sharesNull / n, LIMITS.sharesNull],
     ["이자부부채 경고", s.ibdChecks / n, LIMITS.ibdChecks],
   ];

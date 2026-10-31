@@ -1,9 +1,10 @@
 # kr-valuation-data
 
-한국 상장사 **밸류에이션 데이터 MCP 서버**입니다(구 KICPA Beta MCP / DCF-Peergroup-Search). 네이버 주가·KOSPI 회귀 베타, OpenDART 재무(이자부부채 엔진 v2), 네이버 금융 시장데이터를 분기말 기준으로 사전 수집해 제공합니다. Vercel에 배포하여 Claude for Excel, Claude Desktop, Claude Code 등 원격 MCP 클라이언트에서 바로 사용할 수 있습니다.
+한국 상장사 **밸류에이션 데이터 MCP 서버**입니다(구 KICPA Beta MCP / DCF-Peergroup-Search). OpenDART 재무(이자부부채 엔진 v2)와 사업보고서 본문·Peer 모집단은 분기말 기준으로 사전 수집해 두고, 기준일 종가·시가총액·KOSPI 회귀 베타는 이용자 본인의 공공데이터포털 키로 요청 때 계산합니다. Vercel에 배포하여 Claude for Excel, Claude Desktop, Claude Code 등 원격 MCP 클라이언트에서 바로 사용할 수 있습니다.
 
 핵심 설계 원칙:
-- **캐시 우선, 라이브 폴백**: 분기말 기준 베타·이자부부채·시가총액·현금·실적과 사업보고서 본문은 서버에 사전 수집되어 있어 즉시 응답. 캐시 miss 시에만 같은 규칙으로 실시간 계산합니다.
+- **캐시 우선, 라이브 폴백**: 분기말 기준 이자부부채·현금·실적과 사업보고서 본문은 서버에 사전 수집되어 있어 즉시 응답. 캐시 miss 시에만 같은 규칙으로 실시간 계산합니다.
+- **시세는 저장하지 않음**: 주가·지수 시세(금융위원회 주식시세정보·지수시세정보)는 이용허락범위 제4유형(출처표시·상업적 이용금지·변경금지)이고 제3자 제공·재배포가 금지됩니다. 그래서 서버는 시세를 수집·저장하지 않고, 이용자 본인 키로 그때그때 조회해 종가·시가총액·베타를 계산합니다. 2026-10-31 이전에 쓰던 네이버 금융 수집은 공개 서버에서 껐습니다(네이버 약관의 자동 수집 금지).
 - **시점 일치**: 재무는 평가기준일 당시 공시된 최신 정기보고서(예: 2025-06-30 → 2025 1분기보고서), 주가는 기준일 종가. 사용한 보고서를 응답에 표시합니다.
 - **분기 자동 갱신**: GitHub Actions 가 분기말 직후 수집 → 품질 검사 → 커밋 → Vercel 배포까지 자동으로 수행합니다.
 - **결정론적 Peer 모집단**: (평가기준일, 업종코드) → 항상 동일한 모집단을 반환하는 `peergroup_get_population` 은 불변 분기말 스냅샷만 사용하고 라이브로 폴백하지 않습니다. 응답의 `populationHash` 로 감사 재현성을 보장합니다.
@@ -20,17 +21,25 @@
 | `peergroup_get_population` | **결정론적 Peer 모집단** — (평가기준일, 업종코드) → 불변 분기말 스냅샷에서 동일 모집단 반환. 종목별 사업의 개요 + 부문별 매출(2-phase 페이지네이션) + 배제판단 플래그(스팩/지주사/리츠/12월외결산/관리종목) + `populationHash`. 라이브 폴백 없음 | `data/peer-snapshot/{YYYYMMDD}.json.gz` |
 | `search_by_industry` | KSIC 업종코드/키워드로 해당 업종 전 상장사 리스트 즉시 반환 (최신본, 시점 미고정 — 모집단 확정엔 위 도구 사용) | `data/company-industry.json` |
 | `get_business_content` | 사업보고서 "II. 사업의 내용 / 주요 제품 및 서비스" 원문 추출 (**2,611 / 2,617 종목, 99.8% 커버**) | `data/business-cache/{year}.json.gz` |
-| `valuation_get_data` | **가치평가 통합 패키지** — 베타(Weekly-2Y·Monthly-5Y) + 이자부부채(총액 + 구역·범주별 소계, `ibd_detail=true` 면 계정 행까지, 부채성 항목 분리) + 비지배지분 + 세전이익 + 시가총액 + 현금·자본·실적 + 순차입금·EV. 분기말은 캐시 히트 | `data/valuation-cache/{YYYYMMDD}.json` |
+| `valuation_get_data` | **가치평가 통합 패키지** — 베타(Weekly-2Y·Monthly-5Y, 이용자 키) + 이자부부채(총액 + 구역·범주별 소계, `ibd_detail=true` 면 계정 행까지, 부채성 항목 분리) + 비지배지분 + 세전이익 + 시가총액(이용자 키) + 현금·자본·실적 + 순차입금·EV. 분기말 재무는 캐시 히트 | `data/valuation-cache/{YYYYMMDD}.json` |
 
 ### 실시간 API 조회 (최신 데이터 확보)
 
 | 도구 | 설명 | 데이터 소스 |
 |------|------|-------------|
-| `search_stock` | 종목명/종목코드로 한국 주식 종목 검색 | 네이버 금융 자동완성 |
+| `search_stock` | 종목명/종목코드로 한국 상장 종목 검색 | DART 고유번호 목록(내장) |
 | `dart_get_company` | DART 기업 기본정보 조회 (대표자, 업종, 설립일 등) | OpenDART |
 | `dart_get_financials` | 분기/반기 보고서, 전체 재무제표, 개별(OFS) 조회 등 특수 케이스 | OpenDART |
-| `compute_beta` | **베타 직접 계산** — 네이버 수정주가 + KOSPI 지수 회귀로 Weekly-2Y/Monthly-5Y 산출. 과거 KICPA 공식값과 소수점 6자리 일치. (KICPA/KOSCOM 조회는 영구 장애로 제거됨) | 네이버 금융 |
-| `naver_get_market_data` | 실시간 주가·시가총액·PER·PBR·컨센서스 목표가·동종업종 기업 | 네이버 금융 |
+| `compute_beta` | **베타 직접 계산** — 수정주가 + KOSPI 지수 회귀로 Weekly-2Y/Monthly-5Y 산출. 옛 네이버 기반 값과 소수점 5~6자리 일치(2026-10-31, 5개 종목). 시세가 2020-01-02부터라 Monthly-5Y 관측치 60개는 2025년 이후 기준일부터 | 금융위원회 시세(이용자 키) |
+| `naver_get_market_data` | 실시간 주가·PER·PBR·컨센서스 목표가. **자체 호스팅 전용** - `KVD_ENABLE_NAVER=1` 일 때만 등록 | 네이버 금융 |
+
+### 이용자 키 (시세)
+
+종가·시가총액·베타는 [공공데이터포털](https://www.data.go.kr) 일반 인증키(Decoding)가 있어야 나옵니다. 키 없이 부르면 재무만 돌려주고 `market.error` 에 설정 방법을 싣습니다.
+
+1. 공공데이터포털에서 [금융위원회_주식시세정보](https://www.data.go.kr/data/15094808/openapi.do)와 [금융위원회_지수시세정보](https://www.data.go.kr/data/15094807/openapi.do)를 활용신청합니다(개발계정 자동승인).
+2. 연결 주소 뒤에 `?datagokr_key=<키>` 를 붙이거나, 헤더를 넣을 수 있는 클라이언트는 `x-datagokr-key` 헤더로 보냅니다.
+3. 자체 호스팅이면 환경변수 `DATA_GO_KR_API_KEY` 로 둘 수 있습니다.
 
 👉 **Peer Group 분석 워크플로우**는 [`docs/PEER_GROUP_WORKFLOW.md`](docs/PEER_GROUP_WORKFLOW.md) 참조 — 에이전트가 언제 어떤 도구를 어떤 순서로 호출해야 하는지 정규 시퀀스가 정리되어 있습니다.
 
@@ -40,7 +49,8 @@
 
 - **이자부부채 엔진 v2** (`src/services/opendart/ibd-engine.ts`): 재무상태표 본문 계정을 근거로, 유동/비유동은 "유동부채·비유동부채" 머리 행으로 판정합니다(계정명 부분 문자열 추측 금지). 차입금이 "금융부채"로 묶인 회사(한국전력·셀트리온 등)는 같은 보고서의 XBRL 주석 금액으로 보충하고, 할인발행차금·전환권조정은 차감, 상환전환우선주부채·신종자본증권은 부채성 항목으로 분리합니다. 금융업(은행·보험·증권·여신전문·금융지주)은 산정하지 않습니다. 포괄 행(합계 행)은 소계 초과·정확한 부분합·구조 증거가 모두 있을 때만 빼고, 빠졌을 가능성이 있으면 `completeness: "partial"`로 알립니다. 표본·합성 회귀 테스트(`npm run test:ibd`)로 고정. 엔진 v2.3 — 산정 기준과 독립 검증 결과는 [docs/IBD_POLICY.md](docs/IBD_POLICY.md).
   - v1(주석 멤버 이름 추측)은 SK하이닉스 차입금 누락, 유동/비유동 오분류 107개사 등이 있어 2026-09-30 교체했습니다.
-- **주식수 검증**: DART 유통주식수를 네이버 현재 상장주식수와 대조해 단위 입력 오류(×1,000·×1,000,000)를 보정하고, 분기보고서에 주식수가 없으면 반기·직전 사업보고서로 대체합니다.
+- **주식수 검증**: DART 유통주식수를 기준일 상장주식수(금융위원회 주식시세정보)와 대조해 단위 입력 오류(×1,000·×1,000,000)를 보정하고, 분기보고서에 주식수가 없으면 반기·직전 사업보고서로 대체합니다. DART 주식수가 아예 없으면 요청 때 받은 기준일 상장주식수(자기주식 미차감)로 대신합니다.
+- **수정수익률**: 공공데이터 종가는 수정 전 원주가지만, 대비(vs)가 거래소 기준가(분할·증자 반영) 대비 값이라 `종가 ÷ (종가 − 대비)` 를 이어 붙여 수정주가를 만듭니다(`src/services/market/fsc.ts`).
 - **사업보고서 파싱 99.8% 커버리지**: DART document.xml ZIP 내 모든 XML 파트를 순회하며 점수 기반으로 본문 섹션을 선택. 목차(TOC) 오인식 회피, 태그 사이에 끼어든 문자열 처리, 정정공시 자동 폴백 포함.
 - **146MB 캐시를 Vercel 서버리스로 배포**: gzip(44.9MB) 커밋 + `outputFileTracingIncludes`로 함수 번들에 포함 + cold start에서 1회 해제 후 메모리 메모이즈.
 - **에이전트 파라미터 오해 방지**: 도구 description에 `[⚠️ AI를 위한 엄격한 파라미터 규칙]` 블록으로 `year` vs `valuation_date` 관계 등을 명시.
@@ -64,17 +74,18 @@
 ├── src/services/
 │   ├── tools/                     # MCP 도구 정의
 │   │   ├── peergroup-population.ts # peergroup_get_population (결정론적 모집단)
-│   │   ├── compute-beta.ts        # compute_beta (네이버+KOSPI 직접계산)
+│   │   ├── compute-beta.ts        # compute_beta (수정주가+KOSPI 직접계산)
 │   │   ├── search-stock.ts        # search_stock
 │   │   ├── search-by-industry.ts  # search_by_industry
 │   │   ├── dart-company.ts        # dart_get_company
 │   │   ├── dart-financials.ts     # dart_get_financials
-│   │   ├── naver-market-data.ts   # naver_get_market_data
+│   │   ├── naver-market-data.ts   # naver_get_market_data (자체 호스팅 전용)
 │   │   ├── business-content.ts    # get_business_content
 │   │   └── valuation-data.ts      # valuation_get_data
-│   ├── beta-calc/                 # 네이버+KOSPI 회귀 베타 직접계산
+│   ├── beta-calc/                 # 수정주가+KOSPI 회귀 베타 직접계산
+│   ├── market/                    # 금융위원회 시세 클라이언트(이용자 키, 저장 안 함)
 │   ├── opendart/                  # OpenDART 클라이언트 + XBRL IBD 파서 + 섹션 슬라이서
-│   ├── naver/                     # 네이버 금융 스크래퍼
+│   ├── naver/                     # 네이버 금융 클라이언트 (자체 호스팅 전용)
 │   ├── kicpa/types.ts             # 베타 결과 공유 타입 (KICPA 조회 경로는 제거됨)
 │   ├── cache/                     # valuation-cache / peer-snapshot 로더
 │   ├── common/                    # 종목코드 ↔ corp_code 리졸버
@@ -83,7 +94,7 @@
 │   ├── corp-codes.json            # DART 기업코드 매핑
 │   ├── company-industry.json      # 종목 ↔ KSIC 업종 + 시장구분/결산월/상장일
 │   ├── business-cache/            # 사업보고서 본문 (.json.gz, 커밋됨)
-│   ├── valuation-cache/           # 분기말 밸류에이션 데이터
+│   ├── valuation-cache/           # 분기말 재무 데이터(시세 필드는 비어 있음)
 │   └── peer-snapshot/             # 분기말 Peer 모집단 스냅샷 (.json.gz, 불변)
 ├── docs/
 │   └── PEER_GROUP_WORKFLOW.md     # 에이전트용 워크플로우 가이드
@@ -93,6 +104,7 @@
 │   ├── collect-business-cache.ts  # 사업보고서 본문 수집
 │   ├── collect-valuation-cache.ts # 분기말 밸류에이션 캐시 수집
 │   ├── collect-peer-snapshot.ts   # 분기말 Peer 모집단 스냅샷 수집
+│   ├── smoke-market.ts            # 시세 경로 통합 테스트(이용자 키를 쿼리로)
 │   └── verify-beta-calc.ts        # 베타 수학 검증 (네트워크 불필요)
 └── next.config.ts                 # outputFileTracingIncludes 로 캐시 파일 번들링
 ```
@@ -120,7 +132,7 @@ curl -X POST http://localhost:3000/api/mcp \
 ### 캐시 재생성
 
 ```bash
-# 분기말 밸류에이션 캐시 (기준일 당시 최신 공시 기준 재무 + 기준일 종가·베타)
+# 분기말 밸류에이션 캐시 (기준일 당시 최신 공시 기준 재무. 시세는 넣지 않음)
 npx tsx scripts/collect-valuation-cache.ts 20260630            # 지정 기준일
 npx tsx scripts/collect-valuation-cache.ts --latest            # 아직 없는 최근 분기말
 npm run test:ibd                                               # 이자부부채 엔진 회귀 테스트
@@ -151,7 +163,7 @@ DART 일일 호출 한도(키당 2만 회)에 걸리면 수집 스크립트는 �
 | `collect-quarterly.yml` | 1·4·7·10월 1~12일 매일 | 최근 분기말 밸류에이션 캐시 + Peer 스냅샷 → 품질 검사 → 커밋·Blob 업로드 → Vercel 배포 |
 | `refresh-reference.yml` | 매주 월요일 | DART 기업코드, 업종·시장구분·결산월·상장일 |
 
-저장소 Secrets 에 `OPENDART_API_KEY`(필수), `BLOB_READ_WRITE_TOKEN`(선택)을 등록합니다.
+저장소 Secrets 에 `OPENDART_API_KEY`(필수), `DATA_GO_KR_API_KEY`(선택 - 주식수 단위 대조용, 결과 파일에는 시세를 넣지 않음), `BLOB_READ_WRITE_TOKEN`(선택)을 등록합니다.
 
 ### 저장 — Vercel Blob
 
@@ -171,7 +183,7 @@ Vercel Dashboard → **Settings** → **Environment Variables**에서 아래 변
 |--------|-----|
 | `OPENDART_API_KEY` | OpenDART API 키 ([발급](https://opendart.fss.or.kr)) |
 
-KICPA 베타계수는 서버가 KOSCOM 페이지에서 JSESSIONID 세션 쿠키를 자동 획득하므로 별도 인증 불필요하며, 네이버 금융도 인증이 필요 없습니다.
+공개 배포에는 `DATA_GO_KR_API_KEY` 와 `KVD_ENABLE_NAVER` 를 넣지 않습니다. 시세는 이용자 키로만 조회합니다.
 
 ### 3. 배포 완료 후 MCP URL
 
@@ -186,6 +198,8 @@ https://krvaluation.procpa.co.kr/api/mcp
 ---
 
 ## 클라이언트 연결
+
+아래 주소 뒤에 `?datagokr_key=<공공데이터포털 키>` 를 붙여야 종가·시가총액·베타가 나옵니다(위 "이용자 키" 참고). 키 없이도 재무·Peer 모집단·사업보고서 도구는 동작합니다.
 
 ### Claude for Excel / Claude Desktop
 
@@ -227,7 +241,6 @@ URL에 `https://krvaluation.procpa.co.kr/api/mcp` 입력.
 - "005930의 20251231 기준 밸류에이션 데이터 뽑아줘"
 - "삼성전자의 주요 제품 및 서비스 원문 보여줘"
 - "005930, 000660 종목의 5년 조정베타를 엑셀 표로"
-- "현대차 시가총액·PER·컨센서스 목표가 알려줘"
 - "2차전지 업종 상장사 리스트 전부 뽑아줘"
 
 ---
