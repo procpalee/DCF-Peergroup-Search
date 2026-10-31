@@ -257,7 +257,7 @@ async function collectFinancials(stocks: Stock[], asOf: string, lists: Record<st
 
 // ─── 3. 참조 상장주식수 (금융위원회 주식시세정보, 기준일 전 종목) ───
 
-const FSC_STOCK_API = "https://apis.data.go.kr/1160100/service/GetStockSecuritiesInfoService/getStockPriceInfo";
+const FSC_STOCK_API = "https://apis.data.go.kr/1160100/GetStockSecuritiesInfoService_V2/getStockPriceInfo_V2";
 
 /**
  * 기준일(이전 최근 거래일) 전 종목 상장주식수. DART 주식수의 단위 오류(×1,000 등)를 잡는 대조값으로만 쓴다.

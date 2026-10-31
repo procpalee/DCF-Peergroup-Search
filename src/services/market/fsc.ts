@@ -16,8 +16,9 @@ import type { PricePoint } from "../beta-calc/types";
 export const FSC_SOURCE = "금융위원회 주식시세정보·지수시세정보(공공데이터포털, 이용자 키로 조회)";
 export const FSC_FIRST_DATE = "20200102";
 
-const STOCK_API = "https://apis.data.go.kr/1160100/service/GetStockSecuritiesInfoService/getStockPriceInfo";
-const INDEX_API = "https://apis.data.go.kr/1160100/service/GetMarketIndexInfoService/getStockMarketIndex";
+// V2 주소(2026-10 확인). 새로 활용신청한 키는 예전 service/ 주소에서 "등록되지 않은 서비스키"(30)로 거부된다
+const STOCK_API = "https://apis.data.go.kr/1160100/GetStockSecuritiesInfoService_V2/getStockPriceInfo_V2";
+const INDEX_API = "https://apis.data.go.kr/1160100/GetMarketIndexInfoService_V2/getStockMarketIndex_V2";
 const STOCK_APPLY_URL = "https://www.data.go.kr/data/15094808/openapi.do";
 const INDEX_APPLY_URL = "https://www.data.go.kr/data/15094807/openapi.do";
 const PAGE_ROWS = 3000;
