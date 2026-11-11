@@ -31,18 +31,47 @@ if (!API_KEY) {
   process.exit(1);
 }
 
+// GitHub 러너(해외)에서는 한국 업무 시간대에 다운로드가 2분을 넘기기도 해서
+// 한 번에 5분까지 기다리고, 시간 초과·네트워크 오류·5xx 는 간격을 늘려 다시 받는다.
+const DOWNLOAD_TIMEOUT_MS = 300_000;
+const RETRY_DELAYS_MS = [30_000, 60_000, 120_000];
+
+class FatalHttpError extends Error {}
+
+async function downloadOnce(url: string): Promise<ArrayBuffer> {
+  const response = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+  if (!response.ok) {
+    const msg = `HTTP error: ${response.status} ${response.statusText}`;
+    // 4xx(키 오류 등)는 다시 받아도 같으므로 바로 끝낸다
+    if (response.status < 500) throw new FatalHttpError(msg);
+    throw new Error(msg);
+  }
+  return response.arrayBuffer();
+}
+
+async function downloadWithRetry(url: string): Promise<ArrayBuffer> {
+  for (let attempt = 1; ; attempt++) {
+    const started = Date.now();
+    try {
+      const buffer = await downloadOnce(url);
+      console.log(`Download finished in ${((Date.now() - started) / 1000).toFixed(1)}s (attempt ${attempt})`);
+      return buffer;
+    } catch (err) {
+      if (err instanceof FatalHttpError) throw err;
+      const delay = RETRY_DELAYS_MS[attempt - 1];
+      const reason = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      if (delay === undefined) throw err;
+      console.warn(`Attempt ${attempt} failed after ${((Date.now() - started) / 1000).toFixed(1)}s (${reason}); retrying in ${delay / 1000}s...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
 async function main() {
   console.log("Downloading corp code ZIP from OpenDART...");
 
   const url = `https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key=${API_KEY}`;
-  const response = await fetch(url, { signal: AbortSignal.timeout(120000) });
-
-  if (!response.ok) {
-    console.error(`HTTP error: ${response.status} ${response.statusText}`);
-    process.exit(1);
-  }
-
-  const buffer = await response.arrayBuffer();
+  const buffer = await downloadWithRetry(url);
   const uint8 = new Uint8Array(buffer);
 
   if (uint8[0] !== 0x50 || uint8[1] !== 0x4b) {

@@ -5,8 +5,10 @@ name: 기준정보 주간 갱신
 
 on:
   schedule:
-    # 매주 월요일 06:00 KST (일요일 21:00 UTC)
-    - cron: "0 21 * * 0"
+    # 매주 월요일 00:00 KST (일요일 15:00 UTC)
+    # GitHub 예약 실행은 몇 시간씩 늦게 시작되기도 한다. 한국 업무 시간(월 08:30 KST 이후)에 걸리면
+    # OpenDART 기업코드 다운로드가 해외 러너에서 크게 느려지므로 자정에 걸어 여유를 둔다.
+    - cron: "0 15 * * 0"
   workflow_dispatch:
 
 permissions:
